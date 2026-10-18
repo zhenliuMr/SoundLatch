@@ -181,7 +181,7 @@ private:
 // --------------------------------------------------------------- core
 class DspCore {
 public:
-    static const int kCB = 32;   // control block
+    static constexpr int kCB = 32;   // control block
 
     void Prepare(float fs) {
         fs_ = fs;
