@@ -1,8 +1,10 @@
-# SoundLock — PUBG 音频后处理器
+# SoundLatch — PUBG 音频后处理器（托盘工具）
 
 Windows 实时音频处理：**降低环境音 / 强化脚步声** + **输出限幅**，两个开关，阈值全可调。
 
-- 单文件 `SoundLock.exe`（约 146 KB），无安装、无运行库依赖
+- 单文件 `SoundLatch.exe`（约 190 KB），无安装、无运行库依赖
+- 启动后**隐藏在系统托盘**（右下角），点托盘图标弹出快捷面板，齿轮打开完整设置
+- 界面跟随系统浅色/深色主题，托盘图标自适应明暗
 - 32 位浮点内部处理，48 kHz
 - 音频处理线程 CPU **0.4 %**（单核），进程内存 **17.7 MB**
 - 实测链路延迟见下表
@@ -20,14 +22,14 @@ PUBG  →  CABLE Input   （游戏内音频输出设备选它）
               │
         CABLE Output   （本程序采集）
               │
-        SoundLock.exe
+        SoundLatch.exe
               │
         你的耳机 / 音箱   （本程序输出）
 ```
 
 1. 装 VB-Cable：官方下载 <https://vb-audio.com/Cable/>（约 1 MB，免费），右键 `install_vbcable.bat` → 以管理员身份运行 → 重启
 2. 游戏里把「音频输出设备」设为 `CABLE Input`
-3. 打开 `SoundLock.exe`：采集选 `CABLE Output`，输出选你的耳机
+3. 打开 `SoundLatch.exe`：采集选 `CABLE Output`，输出选你的耳机
 4. 点「启动」
 
 > 没有 VB-Cable 时可勾选「回环捕获」做无驱动测试：此时采集的是**当前默认输出**，
@@ -41,7 +43,7 @@ PUBG  →  CABLE Input   （游戏内音频输出设备选它）
 | ① 降低环境音 + 强化脚步声 | 4 段动态处理：20–150 / 150–600 / 600–3k / 3k–16k | 环境抑制量 0–100%、环境阈值 −60…−18 dBFS、脚步增强 0…+12 dB、瞬态灵敏度 0–100% |
 | ② 锁定最大输出        | 前视砖墙限幅，超阈值即压，不超不动                          | 天花板 −24…0 dBFS                                            |
 
-- 参数改动**立即生效**，自动存到 `%APPDATA%\SoundLock\config.ini`
+- 参数改动**立即生效**，自动存到 `%APPDATA%\SoundLatch\config.ini`
 
 ### 1.3 调参建议（PUBG）
 
@@ -100,7 +102,7 @@ DSP 离线验收（`tests/dsp_test.exe`）：
 ## 4. 目录
 
 ```
-dist/           SoundLock.exe  SigGen.exe(测试信号) install_vbcable.bat
+dist/           SoundLatch.exe  SigGen.exe(测试信号) install_vbcable.bat
 src/            dsp.h  engine.cpp/.h  main.cpp
 tests/          dsp_test.cpp        （离线 DSP 验收）
 tools/          siggen.cpp lat_probe.cpp devfmt.cpp carve.py features.py

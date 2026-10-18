@@ -1,4 +1,4 @@
-# 02 · 技术设计文档（TDD）· SoundLock
+# 02 · 技术设计文档（TDD）· SoundLatch
 
 > 项目：Windows 实时游戏音频处理器（PUBG 场景）
 > 版本：v1.0 草案　日期：2026-10-19
@@ -90,7 +90,7 @@
                                      │ CABLE Output
                                      ▼
                         ┌────────────────────────────┐
-                        │  SoundLock Audio Engine    │
+                        │  SoundLatch Audio Engine    │
                         │  ┌──────────────────────┐  │
                         │  │ Capture Thread       │  │  MMCSS "Pro Audio"
                         │  │ WASAPI event-driven  │  │  AVRT_PRIORITY_CRITICAL
@@ -209,7 +209,7 @@ out    = delayed × gain
 
 ```
 ┌─────────────────────────────────────────┐
-│  SoundLock                    [—][□][×] │
+│  SoundLatch                    [—][□][×] │
 ├─────────────────────────────────────────┤
 │  ① 脚步增强            [ ●────── ] ON   │
 │     环境抑制   ─────●──────   60 %      │
@@ -226,7 +226,7 @@ out    = delayed × gain
 └─────────────────────────────────────────┘
 ```
 
-- 参数改动**立即生效**（无"应用"按钮），写入 `%APPDATA%\SoundLock\config.json`。
+- 参数改动**立即生效**（无"应用"按钮），写入 `%APPDATA%\SoundLatch\config.json`。
 - 首次运行向导：检测 VB-Cable → 引导安装 → 自动把 PUBG 输出设为 CABLE Input → 选择耳机为渲染设备。
 - 提供 **A/B 对比**（勾选「旁通」临时旁路处理），供耳朵验收。热键功能已按需求移除。
 
@@ -244,7 +244,7 @@ out    = delayed × gain
 | 打包 | 单文件 exe + 可选静默安装脚本（含 VB-Cable 检测/引导） | 用户零配置 |
 | 测试 | GoogleTest（DSP 数值）+ 自研 Loopback 延迟测量工具 | 可回归 |
 
-**产物**：`SoundLock.exe`（≤ 3 MB）、`config.json`、`INSTALL.md`。
+**产物**：`SoundLatch.exe`（≤ 3 MB）、`config.json`、`INSTALL.md`。
 
 ---
 

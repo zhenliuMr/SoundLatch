@@ -10,12 +10,12 @@ if errorlevel 1 (
 )
 echo [2/2] compiling...
 g++ -std=c++20 -O2 -municode -mwindows -DUNICODE -D_UNICODE -Wall -Wno-unused-variable ^
-    src\main.cpp src\engine.cpp res\app.res -o dist\SoundLock.exe ^
+    src\main.cpp src\engine.cpp res\app.res -o dist\SoundLatch.exe ^
     -lole32 -luuid -lcomctl32 -lpsapi -lavrt -lgdi32 -luser32 -lshlwapi
 if errorlevel 1 (
   echo BUILD FAILED
   exit /b 1
 )
-strip dist\SoundLock.exe
-for %%F in (dist\SoundLock.exe) do echo OK: %%~fF  %%~zF bytes
+strip dist\SoundLatch.exe
+for %%F in (dist\SoundLatch.exe) do echo OK: %%~fF  %%~zF bytes
 endlocal

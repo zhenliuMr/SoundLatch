@@ -1,2 +1,5 @@
 #include <windows.h>
 1 RT_MANIFEST "app.manifest"
+1 ICON "app.ico"
+2 ICON "tray_light.ico"
+3 ICON "tray_dark.ico"
