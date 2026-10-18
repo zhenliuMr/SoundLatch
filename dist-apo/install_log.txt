@@ -1,15 +1,4 @@
-02:16:02  === SoundLock APO install ===
-02:16:02  admin=True
-02:16:02  reusing certificate 2C75C0D1388A7A64321BDF9209DDF54B348309B3
-02:16:02  certificate trusted (Root + TrustedPublisher)
-02:16:02  signed SoundLockApo.dll: Valid
-02:16:02  signed SoundLockApoCtl.exe: Valid
-02:16:02  copied dll -> C:\Windows\System32\SoundLockApo.dll
-02:16:02  COM class registered
-02:16:02  NOTE: endpoint attachment is not possible on this Windows build:
-02:16:02    - SetupDiSetDeviceProperty(PKEY_FX_*) returns ERROR_INVALID_DATA
-02:16:02    - hand-written MMDevices Fx values are deleted by AudioEndpointBuilder
-02:16:02    a signed driver package (extension INF) is required instead
-02:16:03  audio services left running
-02:16:03  engine not loaded yet (play audio, then re-check)
-02:16:03  done
+02:19:51  === SoundLock APO install ===
+02:19:51  host: PowerShell 7.6.7 (Core)
+02:19:51  admin=False
+02:19:51  ERROR: administrator rights required

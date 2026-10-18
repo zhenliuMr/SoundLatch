@@ -2,6 +2,17 @@
 # Log is UTF-8 without BOM so every reader shows it correctly.
 param([switch]$Uninstall, [switch]$Sign)
 
+# host guard: never run under Windows PowerShell 5.1 - re-exec into PS7
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    $pwsh7 = 'D:\toolchain\pwsh7\pwsh.exe'
+    if (Test-Path $pwsh7) {
+        & $pwsh7 -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Uninstall:$Uninstall -Sign:$Sign
+        exit $LASTEXITCODE
+    }
+    Write-Host "ERROR: PowerShell 7 not found at $pwsh7" -ForegroundColor Red
+    exit 1
+}
+
 $ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
@@ -20,6 +31,7 @@ function Log([string]$m) {
 
 [System.IO.File]::WriteAllText($log, "", $utf8)
 Log "=== SoundLock APO $(if($Uninstall){'uninstall'}else{'install'}) ==="
+Log ("host: PowerShell " + $PSVersionTable.PSVersion.ToString() + " (" + $PSVersionTable.PSEdition + ")")
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 Log "admin=$isAdmin"
