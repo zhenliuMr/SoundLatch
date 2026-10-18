@@ -6,8 +6,14 @@ Class       = AudioProcessingObject
 ClassGuid   = {5989fce8-9cd0-467d-8a6a-5419e31529d4}
 Provider    = %Provider%
 CatalogFile = SoundLockApo.cat
-DriverVer   = 10/19/2026,2.0.0.0
+DriverVer   = 01/01/2026,2.0.0.0
 PnpLockdown = 1
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+SoundLockApo.dll = 1
 
 [DestinationDirs]
 DefaultDestDir = 13

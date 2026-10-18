@@ -12,4 +12,4 @@ echo.
 echo ---- log ----
 %PS% -NoProfile -Command "Get-Content -Encoding UTF8 '%~dp0install_log.txt'"
 echo.
-pause
+timeout /t 5 >nul
