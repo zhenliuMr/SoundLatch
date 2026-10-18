@@ -25,7 +25,7 @@ PUBG  →  CABLE Input   （游戏内音频输出设备选它）
         你的耳机 / 音箱   （本程序输出）
 ```
 
-1. 装 VB-Cable：右键 `install_vbcable.bat` → 以管理员身份运行 → 重启
+1. 装 VB-Cable：官方下载 <https://vb-audio.com/Cable/>（约 1 MB，免费），右键 `install_vbcable.bat` → 以管理员身份运行 → 重启
 2. 游戏里把「音频输出设备」设为 `CABLE Input`
 3. 打开 `SoundLock.exe`：采集选 `CABLE Output`，输出选你的耳机
 4. 点「启动」
