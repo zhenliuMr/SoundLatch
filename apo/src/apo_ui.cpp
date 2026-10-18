@@ -11,7 +11,7 @@
 enum {
     IDC_A = 201, IDC_B = 202,
     IDC_ENVAMT = 210, IDC_ENVTHR = 211, IDC_STEPAMT = 212, IDC_STEPSENS = 213, IDC_CEIL = 214,
-    IDC_APPLY = 220, IDC_INSTALL = 221, IDC_UNINSTALL = 222, IDC_SOUND = 223, IDC_STATUS = 230
+    IDC_APPLY = 220, IDC_INSTALL = 221, IDC_UNINSTALL = 222, IDC_SOUND = 223, IDC_LOG = 224, IDC_STATUS = 230
 };
 
 static HINSTANCE g_inst;
@@ -68,16 +68,73 @@ static void ApplyConfig() {
     SetStatus(L"已保存。参数在下一次音频流启动时生效（切换设备或重新开始播放）。");
 }
 
-static void RunElevated(const wchar_t* file, const wchar_t* args, const wchar_t* okMsg) {
+static std::wstring ModuleDir() {
+    wchar_t p[MAX_PATH];
+    GetModuleFileNameW(nullptr, p, MAX_PATH);
+    std::wstring s = p;
+    size_t i = s.find_last_of(L'\\');
+    return i == std::wstring::npos ? s : s.substr(0, i);
+}
+
+static void ShowLogTail();
+
+// runs install_apo.ps1 elevated; no console window, result goes to the log
+static void RunScript(const wchar_t* args, const wchar_t* busyMsg) {
+    std::wstring ps = ModuleDir() + L"\\install_apo.ps1";
+    std::wstring cmd = L"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"";
+    cmd += ps;
+    cmd += L"\" ";
+    cmd += args;
+
+    SetStatus(busyMsg);
+    UpdateWindow(g_status);
+
     SHELLEXECUTEINFOW sei{};
     sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
     sei.lpVerb = L"runas";
-    sei.lpFile = file;
-    sei.lpParameters = args;
-    sei.nShow = SW_SHOWNORMAL;
-    if (ShellExecuteExW(&sei)) SetStatus(okMsg);
-    else SetStatus(L"操作被取消或需要管理员权限。");
+    sei.lpFile = L"powershell.exe";
+    sei.lpParameters = cmd.c_str();
+    sei.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&sei)) {
+        SetStatus(L"操作被取消，或需要管理员权限。");
+        return;
+    }
+    if (sei.hProcess) {
+        WaitForSingleObject(sei.hProcess, 90000);
+        CloseHandle(sei.hProcess);
+    }
+    ShowLogTail();
 }
+
+static void ShowLogTail() {
+    std::wstring path = ModuleDir() + L"\\install_log.txt";
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { SetStatus(L"未找到日志文件。"); return; }
+    LARGE_INTEGER sz{};
+    GetFileSizeEx(h, &sz);
+    const DWORD keep = 1600;
+    DWORD start = (sz.QuadPart > keep) ? (DWORD)(sz.QuadPart - keep) : 0;
+    SetFilePointer(h, start, nullptr, FILE_BEGIN);
+    char buf[1700] = {0};
+    DWORD got = 0;
+    ReadFile(h, buf, keep, &got, nullptr);
+    CloseHandle(h);
+
+    wchar_t wbuf[1800] = {0};
+    int n = MultiByteToWideChar(CP_UTF8, 0, buf, (int)got, wbuf, 1799);
+    if (n <= 0) { SetStatus(L"日志读取失败。"); return; }
+    wbuf[n] = 0;
+    std::wstring t = wbuf;
+    size_t nl = t.find_last_of(L'\n');
+    if (nl != std::wstring::npos) t = t.substr(0, nl);
+    nl = t.find_last_of(L'\n');
+    if (nl != std::wstring::npos) t = t.substr(nl + 1);
+    while (!t.empty() && (t.back() == L'\r' || t.back() == L'\n')) t.pop_back();
+    SetStatus(t.empty() ? L"见 install_log.txt" : t.c_str());
+}
+
 
 static void LoadConfig() {
     HKEY k = nullptr;
@@ -140,17 +197,20 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_ceil = mk(IDC_CEIL, 0, 240, 210, y + 20); SetFont(g_l5, f); y += 56;
 
         HWND b1 = CreateWindowExW(0, L"BUTTON", L"保存参数", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                  kLeft, y, 110, 32, h, (HMENU)IDC_APPLY, g_inst, nullptr);
+                                  kLeft, y, 100, 32, h, (HMENU)IDC_APPLY, g_inst, nullptr);
         SetFont(b1, fb);
         HWND b2 = CreateWindowExW(0, L"BUTTON", L"安装 APO", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                  kLeft + 120, y, 110, 32, h, (HMENU)IDC_INSTALL, g_inst, nullptr);
+                                  kLeft + 104, y, 100, 32, h, (HMENU)IDC_INSTALL, g_inst, nullptr);
         SetFont(b2, f);
         HWND b3 = CreateWindowExW(0, L"BUTTON", L"卸载 APO", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                  kLeft + 240, y, 110, 32, h, (HMENU)IDC_UNINSTALL, g_inst, nullptr);
+                                  kLeft + 208, y, 100, 32, h, (HMENU)IDC_UNINSTALL, g_inst, nullptr);
         SetFont(b3, f);
         HWND b4 = CreateWindowExW(0, L"BUTTON", L"声音设置", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                  kLeft + 360, y, 110, 32, h, (HMENU)IDC_SOUND, g_inst, nullptr);
+                                  kLeft + 312, y, 100, 32, h, (HMENU)IDC_SOUND, g_inst, nullptr);
         SetFont(b4, f);
+        HWND b5 = CreateWindowExW(0, L"BUTTON", L"查看日志", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                  kLeft + 416, y, 100, 32, h, (HMENU)IDC_LOG, g_inst, nullptr);
+        SetFont(b5, f);
         y += 44;
 
         g_status = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_SIMPLE,
@@ -175,22 +235,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_COMMAND: {
         switch (LOWORD(w)) {
         case IDC_APPLY: ApplyConfig(); break;
-        case IDC_INSTALL: {
-            wchar_t dir[MAX_PATH];
-            GetModuleFileNameW(nullptr, dir, MAX_PATH);
-            wchar_t* p = wcsrchr(dir, L'\\');
-            if (p) *p = 0;
-            std::wstring bat = std::wstring(dir) + L"\\install_apo.bat";
-            RunElevated(bat.c_str(), nullptr, L"已启动安装程序，请在弹出的窗口里确认。");
+        case IDC_INSTALL:
+            RunScript(L"-Sign", L"正在安装（请在 UAC 弹窗里点“是”）…");
             break;
-        }
-        case IDC_UNINSTALL: {
-            wchar_t dir[MAX_PATH];
-            GetModuleFileNameW(nullptr, dir, MAX_PATH);
-            wchar_t* p = wcsrchr(dir, L'\\');
-            if (p) *p = 0;
-            std::wstring bat = std::wstring(dir) + L"\\uninstall_apo.bat";
-            RunElevated(bat.c_str(), nullptr, L"已启动卸载程序。");
+        case IDC_UNINSTALL:
+            RunScript(L"-Uninstall", L"正在卸载…");
+            break;
+        case IDC_LOG: {
+            std::wstring p = ModuleDir() + L"\\install_log.txt";
+            ShellExecuteW(nullptr, L"open", L"notepad.exe", p.c_str(), nullptr, SW_SHOWNORMAL);
             break;
         }
         case IDC_SOUND:

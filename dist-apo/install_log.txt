@@ -1,0 +1,21 @@
+02:03:34  === SoundLock APO install ===
+02:03:34  admin=True
+02:03:34  reusing certificate 2C75C0D1388A7A64321BDF9209DDF54B348309B3
+02:03:34  certificate trusted (Root + TrustedPublisher)
+02:03:34  signed SoundLockApo.dll: Valid
+02:03:34  signed SoundLockApoCtl.exe: Valid
+02:03:34  copied dll -> C:\Windows\System32\SoundLockApo.dll
+02:03:34  COM class registered
+02:03:34    [attach]     set(pid=1) failed, err=13
+02:03:34    [attach] lb�XhV                                   F
+02:03:34    [attach]     set(pid=1) failed, err=13
+02:03:34    [attach] ��KQΘ                                   F
+02:03:34    [attach] endpoints handled: 0
+02:03:34  attach exit=2
+02:03:36  skip [CABLE Input]
+02:03:36  attached [Speakers] -> 
+02:03:36  attached [扬声器] -> 
+02:03:36  endpoints attached: 2
+02:03:38  audio services restarted
+02:03:38  engine not loaded yet (play audio, then re-check)
+02:03:38  done
