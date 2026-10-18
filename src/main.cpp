@@ -434,8 +434,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)w;
-        SetBkMode(dc, TRANSPARENT);
-        return (LRESULT)GetStockObject(NULL_BRUSH);
+        SetBkMode(dc, OPAQUE);
+        SetBkColor(dc, GetSysColor(COLOR_BTNFACE));
+        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
     }
     case WM_DESTROY:
         KillTimer(h, 1);

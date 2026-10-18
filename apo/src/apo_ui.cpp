@@ -31,7 +31,10 @@ static bool IsElevated() {
     return ok;
 }
 
-static void SetStatus(const wchar_t* s) { SetWindowTextW(g_status, s); }
+static void SetStatus(const wchar_t* s) {
+    SetWindowTextW(g_status, s);
+    InvalidateRect(g_status, nullptr, TRUE);   // SS_SIMPLE does not erase itself
+}
 
 static void UpdateLabels() {
     wchar_t b[128];
