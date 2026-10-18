@@ -125,6 +125,7 @@ static inline RECT R4(int x, int y, int w, int h) {
 static const int kLeft = 18, kWidth = 520;
 
 // ----------------------------------------------------------------- helpers
+static void SyncPopup();
 static void SetFont(HWND h, HFONT f) { SendMessageW(h, WM_SETFONT, (WPARAM)f, TRUE); }
 
 static void FillR(HDC dc, RECT r, COLORREF c) {
@@ -249,6 +250,7 @@ static void PushParams() {
     g_params.ceilDb   = -24.0f + SliderPos(4) / 10.0f;
     g_dsp.SetParams(g_params);
     UpdateLabels();
+    SyncPopup();
     if (g_popup) InvalidateRect(g_popup, nullptr, FALSE);
 }
 
@@ -332,7 +334,7 @@ static void StartEngine(bool silent = false) {
     g_running = true;
     SetWindowTextW(g_hStart, L"停止");
     UpdateStatus();
-    if (g_popup) InvalidateRect(g_popup, nullptr, FALSE);
+    SyncPopup();
 }
 
 static void StopEngine() {
@@ -341,7 +343,7 @@ static void StopEngine() {
     g_running = false;
     SetWindowTextW(g_hStart, L"启动");
     UpdateStatus();
-    if (g_popup) InvalidateRect(g_popup, nullptr, FALSE);
+    SyncPopup();
 }
 
 // ----------------------------------------------------------------- tray
@@ -381,227 +383,134 @@ static RECT TrayRect() {
     return r;
 }
 
-// ----------------------------------------------------------------- popup
-static const int PW = 320, PH = 372;
-static RECT g_pSwA{}, g_pSwB{}, g_pMaster{}, g_pGear{}, g_pMeter{};
-static RECT g_pRow[4]{};
-static const int g_pIdx[4] = { 0, 1, 2, 4 };   // envAmt, envThr, stepAmt, ceil
-static int g_drag = -1;
 
-static void DrawSwitch(HDC dc, RECT r, bool on) {
-    int h = r.bottom - r.top;
-    FillRound(dc, r, h / 2, on ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_SCROLLBAR));
-    int knob = h - S(6);
-    int kx = on ? (r.right - S(3) - knob) : (r.left + S(3));
-    RECT k{ kx, r.top + S(3), kx + knob, r.top + S(3) + knob };
-    HBRUSH wb = CreateSolidBrush(on ? GetSysColor(COLOR_WINDOW) : GetSysColor(COLOR_GRAYTEXT));
-    HGDIOBJ ob = SelectObject(dc, wb);
-    HPEN p = CreatePen(PS_SOLID, 1, on ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_SCROLLBAR));
-    HGDIOBJ op = SelectObject(dc, p);
-    Ellipse(dc, k.left, k.top, k.right, k.bottom);
-    SelectObject(dc, ob); SelectObject(dc, op);
-    DeleteObject(wb); DeleteObject(p);
+static HWND g_pA, g_pB, g_pByp, g_pStart, g_pSet, g_pMeter, g_pStatus;
+static HWND g_pSl[4], g_pLbl[4];
+static const int    g_pIdx[4]   = { 0, 1, 2, 4 };   // envAmt, envThr, stepAmt, ceil
+static const wchar_t* g_slName[5] = { L"环境抑制", L"环境阈值", L"脚步增强", L"瞬态灵敏度", L"最大输出" };
+
+// 弹窗 -> 设置窗口
+static void PushFromPopup() {
+    SendMessageW(g_hA, BM_SETCHECK, SendMessageW(g_pA, BM_GETCHECK, 0, 0), 0);
+    SendMessageW(g_hB, BM_SETCHECK, SendMessageW(g_pB, BM_GETCHECK, 0, 0), 0);
+    SendMessageW(g_hBypass, BM_SETCHECK, SendMessageW(g_pByp, BM_GETCHECK, 0, 0), 0);
+    for (int k = 0; k < 4; ++k) {
+        SliderSet(g_pIdx[k], (int)SendMessageW(g_pSl[k], TBM_GETPOS, 0, 0));
+    }
+    PushParams();
 }
 
-static void DrawRow(HDC dc, RECT area, int idx) {
-    wchar_t val[32];
-    FormatValue(idx, val, 32);
-    const wchar_t* names[5] = { L"环境抑制", L"环境阈值", L"脚步增强", L"瞬态灵敏度", L"最大输出" };
-
-    RECT lr{ area.left, area.top, area.left + S(120), area.top + S(16) };
-    Txt(dc, names[idx], lr, GetSysColor(COLOR_GRAYTEXT), g_pSmall, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    RECT vr{ area.right - S(96), area.top, area.right, area.top + S(16) };
-    Txt(dc, val, vr, GetSysColor(COLOR_WINDOWTEXT), g_pSmall, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
-
-    int ty = area.top + S(22);
-    RECT track{ area.left, ty, area.right, ty + S(5) };
-    FillRound(dc, track, 3, GetSysColor(COLOR_SCROLLBAR));
-
-    int lo = (idx == 1) ? 0 : 0;
-    int hi = (idx == 1) ? 42 : (idx == 4 ? 240 : 100);
-    int pos = SliderPos(idx);
-    (void)lo;
-    float t = (float)pos / (float)hi;
-    int fx = area.left + (int)(t * (area.right - area.left));
-    if (fx > area.left + S(2)) {
-        RECT fill{ area.left, ty, fx, ty + S(5) };
-        FillRound(dc, fill, 3, GetSysColor(COLOR_HIGHLIGHT));
+// 设置窗口 -> 弹窗
+static void SyncPopup() {
+    if (!g_popup) return;
+    SendMessageW(g_pA, BM_SETCHECK, SendMessageW(g_hA, BM_GETCHECK, 0, 0), 0);
+    SendMessageW(g_pB, BM_SETCHECK, SendMessageW(g_hB, BM_GETCHECK, 0, 0), 0);
+    SendMessageW(g_pByp, BM_SETCHECK, SendMessageW(g_hBypass, BM_GETCHECK, 0, 0), 0);
+    for (int k = 0; k < 4; ++k) {
+        int idx = g_pIdx[k];
+        SendMessageW(g_pSl[k], TBM_SETPOS, TRUE, SliderPos(idx));
+        wchar_t val[64];
+        FormatValue(idx, val, 64);
+        std::wstring t = std::wstring(g_slName[idx]) + L"   " + val;
+        SetWindowTextW(g_pLbl[k], t.c_str());
     }
-    int cy = ty + S(2);
-    int rr = S(6);
-    HBRUSH b = CreateSolidBrush(GetSysColor(COLOR_HIGHLIGHT));
-    HGDIOBJ ob = SelectObject(dc, b);
-    HPEN p = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNFACE));
-    HGDIOBJ op = SelectObject(dc, p);
-    Ellipse(dc, fx - rr, cy - rr, fx + rr, cy + rr);
-    SelectObject(dc, ob); SelectObject(dc, op);
-    DeleteObject(b); DeleteObject(p);
-}
-
-static void PaintPopup(HWND h) {
-    PAINTSTRUCT ps;
-    HDC dc0 = BeginPaint(h, &ps);
-    RECT rc;
-    GetClientRect(h, &rc);
-    HDC dc = CreateCompatibleDC(dc0);
-    HBITMAP bmp = CreateCompatibleBitmap(dc0, rc.right, rc.bottom);
-    HGDIOBJ obm = SelectObject(dc, bmp);
-
-    FillR(dc, rc, GetSysColor(COLOR_BTNFACE));
-    StrokeRound(dc, rc, 14, g_th.border);
-
-    if (g_icoSmall) DrawIconEx(dc, S(14), S(14), g_icoSmall, S(24), S(24), 0, nullptr, DI_NORMAL);
-    Txt(dc, L"SoundLatch", R4(46, 12, 180, 28), GetSysColor(COLOR_WINDOWTEXT), g_pTitle, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-    g_pGear = R4(PW - 44, 12, 30, 30);
-    {
-        int cx = (g_pGear.left + g_pGear.right) / 2, cy = (g_pGear.top + g_pGear.bottom) / 2;
-        HPEN p = CreatePen(PS_SOLID, S(2), GetSysColor(COLOR_GRAYTEXT));
-        HGDIOBJ op = SelectObject(dc, p);
-        HBRUSH nb = (HBRUSH)GetStockObject(NULL_BRUSH);
-        HGDIOBJ obr = SelectObject(dc, nb);
-        Ellipse(dc, cx - S(7), cy - S(7), cx + S(7), cy + S(7));
-        Ellipse(dc, cx - S(2), cy - S(2), cx + S(2), cy + S(2));
-        SelectObject(dc, op); SelectObject(dc, obr);
-        DeleteObject(p);
-    }
-
-    // vertical level meter
-    g_pMeter = R4(16, 50, 20, PH - 118);
-    FillRound(dc, g_pMeter, 6, GetSysColor(COLOR_SCROLLBAR));
-    {
-        float db = 20.0f * log10f(g_peakDisp + 1e-6f);
-        float n = (db + 60.0f) / 60.0f;
-        if (n < 0) n = 0;
-        if (n > 1) n = 1;
-        int hgt = g_pMeter.bottom - g_pMeter.top;
-        int fh = (int)(n * hgt);
-        if (fh > S(3)) {
-            RECT f = g_pMeter;
-            f.top = f.bottom - fh;
-            FillRound(dc, f, 6, n > 0.92f ? g_th.red : g_th.green);
-        }
-    }
-
-    const int x = 50, w = PW - 50 - 16;
-
-    g_pSwA = R4(x, 54, 40, 22);
-    DrawSwitch(dc, g_pSwA, SendMessageW(g_hA, BM_GETCHECK, 0, 0) == BST_CHECKED);
-    Txt(dc, L"环境音 / 脚步", R4(x + 50, 52, w - 50, 26),
-        SendMessageW(g_hA, BM_GETCHECK, 0, 0) == BST_CHECKED ? GetSysColor(COLOR_WINDOWTEXT) : GetSysColor(COLOR_GRAYTEXT),
-        g_pSmall, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-    g_pRow[0] = R4(x, 86, w, 34);
-    g_pRow[1] = R4(x, 122, w, 34);
-    g_pRow[2] = R4(x, 158, w, 34);
-    DrawRow(dc, g_pRow[0], 0);
-    DrawRow(dc, g_pRow[1], 1);
-    DrawRow(dc, g_pRow[2], 2);
-
-    g_pSwB = R4(x, 200, 40, 22);
-    DrawSwitch(dc, g_pSwB, SendMessageW(g_hB, BM_GETCHECK, 0, 0) == BST_CHECKED);
-    Txt(dc, L"输出限幅", R4(x + 50, 198, w - 50, 26),
-        SendMessageW(g_hB, BM_GETCHECK, 0, 0) == BST_CHECKED ? GetSysColor(COLOR_WINDOWTEXT) : GetSysColor(COLOR_GRAYTEXT),
-        g_pSmall, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-    g_pRow[3] = R4(x, 232, w, 34);
-    DrawRow(dc, g_pRow[3], 4);
-
-    // master on/off
-    g_pMaster = R4(x, 284, w, 40);
-    {
-        int half = (g_pMaster.right - g_pMaster.left) / 2;
-        RECT offR{ g_pMaster.left, g_pMaster.top, g_pMaster.left + half, g_pMaster.bottom };
-        RECT onR{ g_pMaster.left + half, g_pMaster.top, g_pMaster.right, g_pMaster.bottom };
-        FillRound(dc, g_pMaster, 10, GetSysColor(COLOR_BTNFACE));
-        if (g_running) FillRound(dc, onR, 10, GetSysColor(COLOR_HIGHLIGHT));
-        else FillRound(dc, offR, 10, GetSysColor(COLOR_SCROLLBAR));
-        Txt(dc, L"关闭", offR, g_running ? GetSysColor(COLOR_GRAYTEXT) : GetSysColor(COLOR_WINDOWTEXT), g_pBtn, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-        Txt(dc, L"开启", onR, g_running ? GetSysColor(COLOR_WINDOW) : GetSysColor(COLOR_GRAYTEXT), g_pBtn, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-    }
-
-    wchar_t line[128];
-    if (g_running) swprintf(line, 128, L"%.0f ms · 欠载 %d · CPU %.0f%%",
-                            g_engine.LatencyMs(), g_engine.Underruns(), g_cpuPct);
-    else           swprintf(line, 128, L"未运行 · 点击「开启」开始");
-    Txt(dc, line, R4(x, 332, w, 20), GetSysColor(COLOR_GRAYTEXT), g_pSmall, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-    BitBlt(dc0, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
-    SelectObject(dc, obm);
-    DeleteObject(bmp);
-    DeleteDC(dc);
-    EndPaint(h, &ps);
-}
-
-static void ApplyPopupDrag(int px) {
-    RECT r = g_pRow[g_drag < 3 ? g_drag : 3];
-    int idx = g_pIdx[g_drag];
-    float t = (float)(px - r.left) / (float)(r.right - r.left);
-    if (t < 0) t = 0;
-    if (t > 1) t = 1;
-    int hi = (idx == 1) ? 42 : (idx == 4 ? 240 : 100);
-    int v = (int)(t * hi + 0.5f);
-    if (v != SliderPos(idx)) {
-        SliderSet(idx, v);
-        PushParams();
-    }
+    SetWindowTextW(g_pStart, g_running ? L"停止" : L"启动");
 }
 
 static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-    case WM_PAINT:
-        PaintPopup(h);
+    case WM_CREATE: {
+        int kLeft = 14, kW = 332;
+        int y = 10;
+        g_pA = CreateWindowExW(0, L"BUTTON", L"① 降低环境音 + 强化脚步声",
+                               WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                               kLeft, y, kW, 24, h, (HMENU)201, g_hinst, nullptr);
+        SetFont(g_pA, g_fBtn);
+        y += 30;
+        for (int k = 0; k < 3; ++k) {          // 环境抑制 / 环境阈值 / 脚步增强
+            g_pLbl[k] = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                                        kLeft + 10, y, 240, 20, h, nullptr, g_hinst, nullptr);
+            SetFont(g_pLbl[k], g_fLabel);
+            g_pSl[k] = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
+                                       WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
+                                       kLeft + 10, y + 20, kW - 20, 26, h, (HMENU)(300 + k), g_hinst, nullptr);
+            y += 52;
+        }
+        g_pB = CreateWindowExW(0, L"BUTTON", L"② 锁定最大输出音量（限幅）",
+                               WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                               kLeft, y, kW, 24, h, (HMENU)202, g_hinst, nullptr);
+        SetFont(g_pB, g_fBtn);
+        y += 30;
+        g_pLbl[3] = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                                    kLeft + 10, y, 240, 20, h, nullptr, g_hinst, nullptr);
+        SetFont(g_pLbl[3], g_fLabel);
+        g_pSl[3] = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
+                                   WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
+                                   kLeft + 10, y + 20, kW - 20, 26, h, (HMENU)303, g_hinst, nullptr);
+        y += 56;
+        g_pMeter = CreateWindowExW(0, L"SLMETER", L"", WS_CHILD | WS_VISIBLE,
+                                   kLeft, y, kW, 24, h, (HMENU)204, g_hinst, nullptr);
+        y += 30;
+        g_pStart = CreateWindowExW(0, L"BUTTON", L"启动", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                   kLeft, y, 90, 30, h, (HMENU)205, g_hinst, nullptr);
+        SetFont(g_pStart, g_fBtn);
+        g_pByp = CreateWindowExW(0, L"BUTTON", L"旁通(A/B)", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                 kLeft + 100, y, 100, 30, h, (HMENU)206, g_hinst, nullptr);
+        SetFont(g_pByp, g_fLabel);
+        g_pSet = CreateWindowExW(0, L"BUTTON", L"设置…", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                 kLeft + 210, y, 90, 30, h, (HMENU)207, g_hinst, nullptr);
+        SetFont(g_pSet, g_fLabel);
+        y += 38;
+        g_pStatus = CreateWindowExW(0, L"STATIC", L"已停止",
+                                    WS_CHILD | WS_VISIBLE | SS_SIMPLE | SS_NOPREFIX,
+                                    kLeft, y, kW, 20, h, nullptr, g_hinst, nullptr);
+        SetFont(g_pStatus, g_fLabel);
+
+        for (int k = 0; k < 4; ++k) {
+            int idx = g_pIdx[k];
+            int hi = (idx == 1) ? 42 : (idx == 4 ? 240 : 100);
+            SendMessageW(g_pSl[k], TBM_SETRANGE, TRUE, MAKELONG(0, hi));
+            SendMessageW(g_pSl[k], TBM_SETPOS, TRUE, SliderPos(idx));
+        }
+        SyncPopup();
         return 0;
-    case WM_ERASEBKGND:
-        return 1;
-    case WM_ACTIVATE:
-        if (LOWORD(w) == WA_INACTIVE && g_drag < 0) ShowWindow(h, SW_HIDE);
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)w;
+        SetBkMode(dc, TRANSPARENT);
+        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+    }
+    case WM_HSCROLL:
+        PushFromPopup();
         return 0;
-    case WM_KEYDOWN:
-        if (w == VK_ESCAPE) ShowWindow(h, SW_HIDE);
-        return 0;
-    case WM_LBUTTONDOWN: {
-        int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l);
-        auto in = [&](RECT r) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; };
-        if (in(g_pGear)) {
+    case WM_COMMAND: {
+        int id = LOWORD(w);
+        if (id == 201 || id == 202 || id == 206) {
+            PushFromPopup();
+        } else if (id == 205) {
+            if (g_running) StopEngine(); else StartEngine(true);
+            SaveConfig();
+        } else if (id == 207) {
             ShowWindow(h, SW_HIDE);
             ShowWindow(g_hwnd, SW_SHOW);
             SetForegroundWindow(g_hwnd);
-            return 0;
-        }
-        if (in(g_pSwA)) {
-            LRESULT v = SendMessageW(g_hA, BM_GETCHECK, 0, 0);
-            SendMessageW(g_hA, BM_SETCHECK, v == BST_CHECKED ? BST_UNCHECKED : BST_CHECKED, 0);
-            PushParams();
-            return 0;
-        }
-        if (in(g_pSwB)) {
-            LRESULT v = SendMessageW(g_hB, BM_GETCHECK, 0, 0);
-            SendMessageW(g_hB, BM_SETCHECK, v == BST_CHECKED ? BST_UNCHECKED : BST_CHECKED, 0);
-            PushParams();
-            return 0;
-        }
-        if (in(g_pMaster)) {
-            if (g_running) StopEngine(); else StartEngine(true);
-            SaveConfig();
-            InvalidateRect(h, nullptr, FALSE);
-            return 0;
-        }
-        for (int i = 0; i < 4; ++i) {
-            if (in(g_pRow[i])) {
-                g_drag = i;
-                SetCapture(h);
-                ApplyPopupDrag(x);
-                return 0;
-            }
         }
         return 0;
     }
-    case WM_MOUSEMOVE:
-        if (g_drag >= 0) { ApplyPopupDrag(GET_X_LPARAM(l)); return 0; }
+    case WM_TIMER:
+        if (w == 1) {
+            if (g_pMeter) InvalidateRect(g_pMeter, nullptr, FALSE);
+            wchar_t b[256];
+            if (g_running) swprintf(b, 256, L"%.0f ms · 欠载 %d · CPU %.0f%%",
+                                    g_engine.LatencyMs(), g_engine.Underruns(), g_cpuPct);
+            else swprintf(b, 256, L"未运行 · 点击「启动」开始");
+            SetWindowTextW(g_pStatus, b);
+            InvalidateRect(g_pStatus, nullptr, TRUE);
+            return 0;
+        }
         return 0;
-    case WM_LBUTTONUP:
-        if (g_drag >= 0) { g_drag = -1; ReleaseCapture(); SaveConfig(); }
+    case WM_CLOSE:
+        ShowWindow(h, SW_HIDE);
         return 0;
     }
     return DefWindowProcW(h, m, w, l);
@@ -609,23 +518,22 @@ static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 static void ShowPopup() {
     if (!g_popup) {
-        g_popup = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"SoundLatchPopup", L"",
-                                  WS_POPUP, 0, 0, S(PW), S(PH), g_hwnd, nullptr, g_hinst, nullptr);
-        HRGN rgn = CreateRoundRectRgn(0, 0, S(PW) + 1, S(PH) + 1, S(14), S(14));
-        SetWindowRgn(g_popup, rgn, TRUE);
+        g_popup = CreateWindowExW(WS_EX_TOOLWINDOW, L"SoundLatchPopup", L"SoundLatch 控制面板",
+                                  WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                                  0, 0, S(360), S(450), g_hwnd, nullptr, g_hinst, nullptr);
     }
     RECT tr = TrayRect();
-    int w = S(PW), h = S(PH);
-    int x = (int)tr.left - w / 2;
-    int y = (int)tr.top - h - S(8);
     RECT wa;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    int w = S(360), h = S(450);
+    int x = (int)tr.left - w / 2;
+    int y = (int)tr.top - h - S(8);
     if (x + w > wa.right - S(8)) x = wa.right - w - S(8);
     if (x < wa.left + S(8)) x = wa.left + S(8);
     if (y < wa.top + S(8)) y = wa.top + S(8);
-    SetWindowPos(g_popup, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+    SetWindowPos(g_popup, HWND_TOP, x, y, w, h, SWP_SHOWWINDOW);
     SetForegroundWindow(g_popup);
-    InvalidateRect(g_popup, nullptr, FALSE);
+    SyncPopup();
 }
 
 // ----------------------------------------------------------------- meter
@@ -646,7 +554,7 @@ static LRESULT CALLBACK MeterProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         RECT bar = rc;
         bar.bottom -= S(4);
         bar.right = rc.left + (LONG)(norm * wdt);
-        FillR(dc, bar, norm > 0.93f ? g_th.red : (norm > 0.80f ? g_th.amber : g_th.green));
+        FillR(dc, bar, norm > 0.93f ? RGB(210, 70, 60) : (norm > 0.80f ? RGB(210, 170, 60) : RGB(64, 168, 110)));
         EndPaint(h, &ps);
         return 0;
     }
@@ -830,11 +738,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (w == 1) {
             g_peakDisp = g_dsp.MeterPeak();
             if (g_hMeter) InvalidateRect(g_hMeter, nullptr, FALSE);
-            if (g_popup && IsWindowVisible(g_popup)) {
-                RECT mr = g_pMeter;
-                InflateRect(&mr, S(2), S(2));
-                InvalidateRect(g_popup, &mr, FALSE);
-            }
             return 0;
         }
         ULONGLONG now = GetTickCount64();
@@ -855,10 +758,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_lastT = now;
         }
         UpdateStatus();
-        if (g_popup && IsWindowVisible(g_popup)) {
-            RECT sr = R4(50, 330, PW - 66, 22);
-            InvalidateRect(g_popup, &sr, FALSE);
-        }
         return 0;
     }
     case WM_CLOSE:
@@ -930,6 +829,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     pc.lpfnWndProc = PopupProc;
     pc.hInstance = hInst;
     pc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    pc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     pc.lpszClassName = L"SoundLatchPopup";
     RegisterClassExW(&pc);
 
