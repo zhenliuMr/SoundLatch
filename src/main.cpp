@@ -167,12 +167,14 @@ static void UpdateStatus(const wchar_t* extra = nullptr) {
     if (!g_running) {
         swprintf(b, 512, L"状态：已停止%s%s", extra ? L" · " : L"", extra ? extra : L"");
         SetWindowTextW(g_hStatus, b);
+        InvalidateRect(g_hStatus, nullptr, TRUE);
         return;
     }
     swprintf(b, 512,
              L"延迟 %.1f ms ｜ 欠载 %d ｜ 采样比 %.3f ｜ CPU %.1f%%",
              g_engine.LatencyMs(), g_engine.Underruns(), g_engine.DbgRatio(), g_cpuPct);
     SetWindowTextW(g_hStatus, b);
+    InvalidateRect(g_hStatus, nullptr, TRUE);
 }
 
 static void StartEngine() {
@@ -225,9 +227,11 @@ static LRESULT CALLBACK MeterProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         HDC dc = BeginPaint(h, &ps);
         RECT rc;
         GetClientRect(h, &rc);
-        HBRUSH bg = CreateSolidBrush(RGB(28, 28, 28));
+        HBRUSH bg = CreateSolidBrush(GetSysColor(COLOR_BTNFACE));
         FillRect(dc, &rc, bg);
         DeleteObject(bg);
+        RECT frame = rc;
+        FrameRect(dc, &frame, GetSysColorBrush(COLOR_3DSHADOW));
 
         int wdt = rc.right - rc.left;
         float dbv = 20.0f * log10f(g_peakDisp + 1e-6f);
@@ -238,23 +242,13 @@ static LRESULT CALLBACK MeterProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         bar.bottom -= 6;
         bar.right = rc.left + (LONG)(norm * wdt);
 
-        COLORREF c = RGB(60, 180, 110);
+        COLORREF c = RGB(64, 168, 110);
         if (norm > 0.93f) c = RGB(210, 70, 60);
         else if (norm > 0.80f) c = RGB(210, 170, 60);
         HBRUSH fb = CreateSolidBrush(c);
         FillRect(dc, &bar, fb);
         DeleteObject(fb);
 
-        // -6 dB / -18 dB ticks
-        HPEN pen = CreatePen(PS_SOLID, 1, RGB(90, 90, 90));
-        HGDIOBJ old = SelectObject(dc, pen);
-        for (float d : {-18.f, -6.f}) {
-            int x = rc.left + (int)(((d + 60.f) / 60.f) * wdt);
-            MoveToEx(dc, x, rc.top, nullptr);
-            LineTo(dc, x, rc.bottom - 6);
-        }
-        SelectObject(dc, old);
-        DeleteObject(pen);
         EndPaint(h, &ps);
         return 0;
     }
@@ -286,11 +280,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         struct Row { int id; int* dummy; };
         auto mkSlider = [&](int id, int lo, int hi, int pos, int x, int yy, int wdt) {
-            HWND s = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ,
+            HWND s = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
                                      x, yy, wdt, 26, h, (HMENU)id, g_hinst, nullptr);
             SendMessageW(s, TBM_SETRANGE, TRUE, MAKELONG(lo, hi));
             SendMessageW(s, TBM_SETPOS, TRUE, pos);
-            SendMessageW(s, TBM_SETTICFREQ, (hi - lo) / 10 ? (hi - lo) / 10 : 1, 0);
             return s;
         };
 
@@ -473,7 +466,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     mc.lpszClassName = L"SLMETER";
     RegisterClassExW(&mc);
 
-    RECT r{0, 0, kWidth + kLeft * 2, 860};
+    RECT r{0, 0, kWidth + kLeft * 2, 735};
     AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     g_hwnd = CreateWindowExW(0, L"SoundLockWnd", L"SoundLock", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                              CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
