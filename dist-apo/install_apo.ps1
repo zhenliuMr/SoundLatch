@@ -88,42 +88,13 @@ Set-ItemProperty -Path "Registry::HKEY_CLASSES_ROOT\CLSID\$cls\InprocServer32" -
 Set-ItemProperty -Path "Registry::HKEY_CLASSES_ROOT\CLSID\$cls\InprocServer32" -Name 'ThreadingModel' -Value 'Both'
 Log "COM class registered"
 
-$attachTool = Join-Path $here 'apo_attach.exe'
-if (Test-Path $attachTool) {
-    & $attachTool attach 2>&1 | ForEach-Object { Log "  [attach] $_" }
-    Log "attach exit=$LASTEXITCODE"
-}
+Log "NOTE: endpoint attachment is not possible on this Windows build:"
+Log "  - SetupDiSetDeviceProperty(PKEY_FX_*) returns ERROR_INVALID_DATA"
+Log "  - hand-written MMDevices Fx values are deleted by AudioEndpointBuilder"
+Log "  a signed driver package (extension INF) is required instead"
 
-# AudioEndpointBuilder keeps endpoint properties in memory: stop it before writing
-# the FX key, otherwise the values are reverted when its cache is flushed.
-Stop-Service audiosrv -Force -ErrorAction SilentlyContinue
-Stop-Service AudioEndpointBuilder -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 800
-
-$attached = 0
-foreach ($k in Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render' -ErrorAction SilentlyContinue) {
-    $state = (Get-ItemProperty $k.PSPath -Name DeviceState -ErrorAction SilentlyContinue).DeviceState
-    if ($state -ne 1) { continue }
-    $props = $k.PSPath + '\Properties'
-    $name = (Get-ItemProperty $props -ErrorAction SilentlyContinue).'{a45c254e-df1c-4efd-8020-67d146a850e0},2'
-    if (-not $name) { $name = '(unnamed)' }
-    if ("$name" -match 'CABLE|Broadcast|Virtual|VoiceMeeter') { Log "skip [$name]"; continue }
-
-    $fx = $k.PSPath + '\Fx\0'
-    New-Item -Path $fx -Force | Out-Null
-    foreach ($n in @("$pkey,1", "$pkey,2", "$pkey,3")) {
-        New-ItemProperty -Path $fx -Name $n -Value $cls -PropertyType String -Force | Out-Null
-    }
-    $check = (Get-ItemProperty $fx)."$pkey,1"
-    Log "attached [$name] -> $check"
-    $attached++
-}
-Log "endpoints attached: $attached"
-
-Start-Service AudioEndpointBuilder -ErrorAction SilentlyContinue
-Start-Service audiosrv -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 1500
-Log "audio services restarted"
+Start-Sleep -Milliseconds 300
+Log "audio services left running"
 
 $mods = @()
 Get-Process audiodg -ErrorAction SilentlyContinue | ForEach-Object {

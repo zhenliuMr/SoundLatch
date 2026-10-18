@@ -96,10 +96,24 @@ static void RunScript(const wchar_t* args, const wchar_t* busyMsg) {
     sei.cbSize = sizeof(sei);
     sei.fMask = SEE_MASK_NOCLOSEPROCESS;
     sei.lpVerb = L"runas";
-    sei.lpFile = L"powershell.exe";
     sei.lpParameters = cmd.c_str();
     sei.nShow = SW_HIDE;
-    if (!ShellExecuteExW(&sei)) {
+
+    // prefer PowerShell 7 (known install path first, then PATH), fall back to 5.1
+    const wchar_t* candidates[] = { L"D:\\toolchain\\pwsh7\\pwsh.exe", L"pwsh.exe", L"powershell.exe" };
+    BOOL ok = FALSE;
+    for (const wchar_t* c : candidates) {
+        if (wcsstr(c, L"\\") && GetFileAttributesW(c) == INVALID_FILE_ATTRIBUTES) continue;
+        SHELLEXECUTEINFOW s{};
+        s.cbSize = sizeof(s);
+        s.fMask = SEE_MASK_NOCLOSEPROCESS;
+        s.lpVerb = L"runas";
+        s.lpFile = c;
+        s.lpParameters = cmd.c_str();
+        s.nShow = SW_HIDE;
+        if (ShellExecuteExW(&s)) { sei = s; ok = TRUE; break; }
+    }
+    if (!ok || (INT_PTR)sei.hProcess <= 0) {
         SetStatus(L"操作被取消，或需要管理员权限。");
         return;
     }
