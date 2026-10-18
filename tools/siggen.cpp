@@ -9,11 +9,15 @@
 #include <cstring>
 #include <cmath>
 #include <string>
+#include <vector>
+#include <clocale>
 
 static const PROPERTYKEY kName = {
     {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
 
 int wmain(int argc, wchar_t** argv) {
+    SetConsoleOutputCP(CP_UTF8);
+    setlocale(LC_ALL, ".UTF8");
     const wchar_t* want = argc > 1 ? argv[1] : L"CABLE Input";
     double secs = argc > 2 ? _wtof(argv[2]) : 10.0;
     std::string mode = argc > 3 ? "burst" : "burst";
@@ -38,10 +42,10 @@ int wmain(int argc, wchar_t** argv) {
         ps->GetValue(kName, &v);
         std::wstring name = (v.vt == VT_LPWSTR && v.pwszVal) ? v.pwszVal : L"";
         PropVariantClear(&v); ps->Release();
-        wprintf(L"[%u] %s\n", i, name.c_str());
+        wprintf(L"[%u] %ls\n", i, name.c_str());
         if (!dev && name.find(want) != std::wstring::npos) { dev = d; } else d->Release();
     }
-    if (!dev) { wprintf(L"device not found: %s\n", want); return 1; }
+    if (!dev) { wprintf(L"device not found: %ls\n", want); return 1; }
 
     IAudioClient* cl = nullptr;
     dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&cl);
