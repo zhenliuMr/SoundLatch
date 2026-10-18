@@ -1,0 +1,28 @@
+# build outputs
+*.exe
+*.dll
+*.obj
+*.o
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# analysis intermediates
+samples/
+tools/vgm/
+*.wav
+*.wem
+*.png
+
+# third-party driver installer (downloaded at build time, not our code)
+dist/vbcable/
+
+# GBK/UTF-16 leftovers
+*.bak
+Thumbs.db
+desktop.ini
+
+# local toolchain artifacts
+*.zip
+.workbuddy/
