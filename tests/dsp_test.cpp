@@ -67,16 +67,18 @@ int main() {
         printf("[T2] crossover flatness @1k: %.2f dB %s\n", err, fabs(err) < 0.5 ? "PASS" : "FAIL");
     }
 
-    // ---- 3. environment (60 Hz) suppression
+    // ---- 3. 环境抑制基本通路：低频独大时压低频，且中高频不受牵连
+// 注意：判据已从「绝对 dBFS 阈值」改为「谱倾斜」，所以测试信号必须低频明显大于
+// 中高频才该被压。等幅信号现在正确地不被压（见 T3b）。
     {
         DspCore d; d.Prepare((float)fs);
         DspParams p; p.aOn = true; p.bOn = false;
-        p.envAmt = 1.f; p.envThrDb = -30.f; p.stepAmt = 0.f; p.stepSens = .5f;
+        p.envAmt = 1.f; p.stepAmt = 0.f;
         d.SetParams(p);
         std::vector<float> in(N * 2), out(N * 2);
         for (int i = 0; i < N; ++i) {
-            float s = 0.1f * sinf(2 * 3.14159265f * 60.f * i / fs)
-                    + 0.1f * sinf(2 * 3.14159265f * 1000.f * i / fs);
+            float s = 0.5f * sinf(2 * 3.14159265f * 60.f * i / fs)
+                    + 0.05f * sinf(2 * 3.14159265f * 1000.f * i / fs);  // 低频独大 20dB
             in[2 * i] = in[2 * i + 1] = s;
         }
         out = in;
@@ -86,16 +88,59 @@ int main() {
         double b1 = goertzelAmp(mo2, 60, fs, N / 2, 16384);
         double m0 = goertzelAmp(mi2, 1000, fs, N / 2, 16384);
         double m1 = goertzelAmp(mo2, 1000, fs, N / 2, 16384);
-        printf("[T3] 60Hz %+.1f dB (want <= -12) %s | 1kHz %+.1f dB (want |d|<3)\n",
-               20 * log10(b1 / b0), 20 * log10(b1 / b0) <= -12 ? "PASS" : "FAIL",
-               20 * log10(m1 / m0));
+        double g60 = 20 * log10(b1 / b0), g1k = 20 * log10(m1 / m0);
+        printf("[T3] 低频独大时 60Hz %+.1f dB (want <= -12) %s | 1kHz %+.1f dB (want |d|<3) %s\n",
+               g60, g60 <= -12 ? "PASS" : "FAIL",
+               g1k, fabs(g1k) < 3 ? "PASS" : "FAIL");
+    }
+
+    // ---- 3b. 谱倾斜判据：低频独大才压，两者在同一绝对电平下对比
+    // 环境抑制现在不看绝对电平，只看「低频相对中高频是否独大」（tilt > 6dB 才介入）。
+    // 下面两个信号峰值相同，唯一区别是频谱倾斜，必须得到完全不同的增益。
+    {
+        printf("[T3b] 谱倾斜判据（tiltOn=%.0f dB, tiltFull=%.0f dB）\n",
+               sl::judge::kTiltOn, sl::judge::kTiltFull);
+        struct Case { const char* tag; float lowAmp; float midAmp; float expectSupp; };
+        // 低频独大 20dB → 应被明显压制；等幅 → 不该被压
+        const Case cases[] = {
+            { "低频独大 20dB", 0.5f, 0.05f, true  },
+            { "低频独大 12dB", 0.5f, 0.125f, true },
+            { "低频独大 16dB", 0.5f, 0.063f, true },
+            { "等幅 0dB",      0.5f, 0.5f,  false },
+            { "中频更大",      0.2f, 0.5f,  false },
+        };
+        bool allPass = true;
+        for (const Case& c : cases) {
+            DspCore d; d.Prepare((float)fs);
+            DspParams p; p.aOn = true; p.bOn = false;
+            p.envAmt = 1.f; p.stepAmt = 0.f;
+            d.SetParams(p);
+            std::vector<float> in(N * 2), out(N * 2);
+            for (int i = 0; i < N; ++i) {
+                float s = c.lowAmp * sinf(2 * 3.14159265f * 60.f * i / fs)
+                        + c.midAmp * sinf(2 * 3.14159265f * 1000.f * i / fs);
+                in[2 * i] = in[2 * i + 1] = s;
+            }
+            out = in;
+            d.Process(out.data(), N);
+            auto mi = mono(in), mo = mono(out);
+            double g0 = goertzelAmp(mi, 60, fs, N / 2, 16384);
+            double g1 = goertzelAmp(mo, 60, fs, N / 2, 16384);
+            double g = 20 * log10(g1 / g0);
+            bool suppressed = (g < -3.0f);
+            bool ok = (suppressed == c.expectSupp);
+            allPass = allPass && ok;
+            printf("      %-14s 60Hz %+6.1f dB  期望%s  %s\n",
+                   c.tag, g, c.expectSupp ? "压制" : "不压", ok ? "PASS" : "FAIL");
+        }
+        printf("[T3b] 谱倾斜判据整体 %s\n", allPass ? "PASS" : "FAIL");
     }
 
     // ---- 4. transient (footstep-like) boost
     {
         DspCore d; d.Prepare((float)fs);
         DspParams p; p.aOn = true; p.bOn = false;
-        p.envAmt = 0.f; p.stepAmt = 1.f; p.stepSens = 1.f;
+        p.envAmt = 0.f; p.stepAmt = 1.f;
         d.SetParams(p);
         std::vector<float> in(N * 2), out(N * 2);
         std::mt19937 rng(7);
