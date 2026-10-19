@@ -47,8 +47,10 @@ static POINT g_anchor{};
 static bool  g_anchorValid = false;
 static bool  g_popupShown = false;          // 面板是否处于展开状态（唯一状态源）
 static ULONGLONG g_autoHideTick = 0;        // 因失焦自动收起的时刻
+static ULONGLONG g_showTick = 0;           // 最近一次显示面板的时刻
 static HWND g_hA, g_hB, g_hEnvAmt, g_hEnvThr, g_hStepAmt, g_hStepSens, g_hCeil;
 static HWND g_hCap, g_hRen, g_hLoop, g_hReset, g_hMeter, g_hAuto, g_hPin;
+static HWND g_hQ1, g_hQ2, g_tip;   // 问号说明 + 悬浮提示
 static bool g_pinned = false;   // 固定到屏幕：失焦也不收起
 static HWND g_hLblEnvAmt, g_hLblEnvThr, g_hLblStepAmt, g_hLblStepSens, g_hLblCeil;
 
@@ -246,6 +248,10 @@ static void SyncDarkMode(HWND h) {
 static void RefreshTheme(HWND h) {
     MakeTheme();
     SyncDarkMode(h);
+    if (g_tip) {                     // 提示气泡也要跟着主题换底色/字色
+        SendMessageW(g_tip, TTM_SETTIPBKCOLOR, (WPARAM)g_th.bg, 0);
+        SendMessageW(g_tip, TTM_SETTIPTEXTCOLOR, (WPARAM)g_th.text, 0);
+    }
     if (IsWindow(h)) {
         // 类背景刷也要跟着主题换，否则系统垫底永远是浅色
         SetClassLongPtrW(h, GCLP_HBRBACKGROUND, (LONG_PTR)g_brBg);
@@ -675,9 +681,14 @@ static void LayoutPopupIn(HWND h, int cw, int ch) {
     const int pad = S(14);
     const int kW  = cw - pad * 2;
     const int ind = S(10);
+    const int qs  = S(20);                 // 问号方块
     int y = S(10);
 
-    MoveWindow(g_hA, pad, y, kW, S(24), TRUE);
+    // 复选框只覆盖"方框 + 文字"，点空白处不会误触发；问号说明独立放在最右
+    int wA = MeasureText(h, g_fBtn, L"降低环境音 + 强化脚步声") + S(28);
+    int wB = MeasureText(h, g_fBtn, L"锁定最大输出音量") + S(28);
+    MoveWindow(g_hA, pad, y, wA, S(24), TRUE);
+    MoveWindow(g_hQ1, pad + kW - qs, y + (S(24) - qs) / 2, qs, qs, TRUE);
     y += S(28);
 
     HWND sl[4] = { g_hEnvAmt, g_hEnvThr, g_hStepAmt, g_hStepSens };
@@ -688,7 +699,8 @@ static void LayoutPopupIn(HWND h, int cw, int ch) {
         y += S(44);
     }
 
-    MoveWindow(g_hB, pad, y, kW, S(24), TRUE);
+    MoveWindow(g_hB, pad, y, wB, S(24), TRUE);
+    MoveWindow(g_hQ2, pad + kW - qs, y + (S(24) - qs) / 2, qs, qs, TRUE);
     y += S(28);
 
     MoveWindow(g_hLblCeil, pad + ind, y, kW - ind, S(18), TRUE);
@@ -717,8 +729,8 @@ static void LayoutPopupIn(HWND h, int cw, int ch) {
 
 static void PopupContentSize(HWND h, int& cw, int& ch) {
     const int pad = S(14);
-    int w = MeasureText(h, g_fBtn, L"降低环境音 + 强化脚步声") + S(26);
-    int w2 = MeasureText(h, g_fBtn, L"锁定最大输出音量") + S(26);
+    int w = MeasureText(h, g_fBtn, L"降低环境音 + 强化脚步声") + S(28) + S(30);
+    int w2 = MeasureText(h, g_fBtn, L"锁定最大输出音量") + S(28) + S(30);
     if (w2 > w) w = w2;
     for (int i = 0; i < 5; ++i) {
         wchar_t t[96];
@@ -838,6 +850,44 @@ static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetFont(g_hB, g_fBtn);
         SendMessageW(g_hB, BM_SETCHECK, BST_CHECKED, 0);
 
+        // 问号说明：鼠标悬浮显示下面几条滑杆对 PUBG 声音的影响
+        auto mkQ = [&](const wchar_t* tip) {
+            HWND q = CreateWindowExW(0, L"STATIC", L"?",
+                                     WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_CENTER | SS_CENTERIMAGE,
+                                     0, 0, S(20), S(20), h, nullptr, g_hinst, nullptr);
+            SetFont(q, g_fLabel);
+            if (g_tip) {
+                TOOLINFOW ti{};
+                ti.cbSize = sizeof(ti);
+                ti.uFlags = TTF_SUBCLASS | TTF_IDISHWND;   // uId 直接放窗口句柄，否则提示会挂到父窗口上
+                ti.hwnd   = h;
+                ti.uId    = (UINT_PTR)q;
+                ti.lpszText = (LPWSTR)tip;
+                SendMessageW(g_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+            }
+            return q;
+        };
+        g_tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP,
+                                0, 0, 0, 0, h, nullptr, g_hinst, nullptr);
+        if (g_tip) {
+            SendMessageW(g_tip, TTM_SETMAXTIPWIDTH, 0, S(320));
+            SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_AUTOMATIC, 300);
+            SendMessageW(g_tip, TTM_SETTIPBKCOLOR, (WPARAM)g_th.bg, 0);
+            SendMessageW(g_tip, TTM_SETTIPTEXTCOLOR, (WPARAM)g_th.text, 0);
+        }
+        g_hQ1 = mkQ(L"\u9648\u4f4e\u73af\u5883\u97f3 + \u5f3a\u5316\u811a\u6b65\u58f0\n"
+                    L"\n"
+                    L"\u73af\u5883\u6291\u5236\uff1a\u538b\u4f4e 20-150 Hz\uff08\u7206\u70b8\u8f6f\u9e23\u3001\u8f7d\u5177\u5f15\u64ce\u3001\u8fdc\u5904\u70ae\u58f0\uff09\u3002\u8c03\u9ad8\u66f4\u5e72\u51c0\uff0c\u4f46\u7206\u70b8\u51b2\u51fb\u611f\u53d8\u5f31\u3002\n"
+                    L"\u73af\u5883\u9608\u503c\uff1a\u4f4e\u4e8e\u8fd9\u4e2a\u7535\u5e73\u7684\u4f4e\u9891\u624d\u7b97\u73af\u5883\uff0c\u4f1a\u88ab\u989d\u5916\u538b\u4f4e\uff1b\u9ad8\u4e8e\u5b83\u89c6\u4e3a\u5b9e\u97f3\u4fdd\u7559\u3002\n"
+                    L"\u811a\u6b65\u589e\u5f3a\uff1a\u62ac\u9ad8 150 Hz \u4ee5\u4e0a\uff0c\u5176\u4e2d 0.6-3k\uff08\u811a\u6b65\u4e3b\u4f53\uff09\u62ac\u5f97\u6700\u591a\uff0c3-16k \u62ac\u4e00\u534a\u3002\n"
+                    L"\u77ac\u6001\u7075\u654f\u5ea6\uff1a\u591a\u5c0f\u7684\u54cd\u52a8\u624d\u89e6\u53d1\u589e\u5f3a\u3002\u9ad8=\u8f7b\u811a\u6b65\u4e5f\u6293\u5f97\u5230\uff0c\u4f4e=\u53ea\u6709\u5f00\u67aa\u7206\u70b8\u624d\u89e6\u53d1\u3002");
+        g_hQ2 = mkQ(L"\u9501\u5b9a\u6700\u5927\u8f93\u51fa\u97f3\u91cf\n"
+                    L"\n"
+                    L"\u6700\u5927\u8f93\u51fa\uff1a\u8f93\u51fa\u5cf0\u503c\u7684\u5929\u82b1\u677f\u3002\u8d85\u8fc7\u7684\u90e8\u5206\u77ac\u95f4\u538b\u5230\u8fd9\u6761\u7ebf\uff0c80 ms \u540e\u6062\u590d\u3002\n"
+                    L"100% = 0 dBFS \u4e0d\u9650\u5236\uff1b1% = -18 dBFS\uff1b0% = \u9759\u97f3\u3002\n"
+                    L"\u8d85\u8fc7\u5f97\u591a\u538b\u5f97\u8d8a\u591a\uff0c\u4f46\u97f3\u8272\u4e0d\u53d8\uff08\u6574\u6761\u4fe1\u53f7\u540c\u4e00\u4e2a\u589e\u76ca\uff09\u3002\n"
+                    L"\u4e5f\u53ef\u4ee5\u76f4\u63a5\u5728\u4e0b\u65b9\u7684\u7535\u5e73\u67f1\u4e0a\u6309\u4f4f\u5de6\u53f3\u62d6\u52a8\u6765\u8bbe\u7f6e\u3002");
+
         g_hLblCeil = mkLabel(L"");
         g_hCeil    = mkSlider(IDC_CEIL, 0, kCeilPosMax, 950);
         g_hMeter   = CreateWindowExW(0, L"SLMETER", L"", WS_CHILD | WS_VISIBLE,
@@ -939,6 +989,9 @@ static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (!next) next = GetForegroundWindow();
             if (next == h || (next && IsChild(h, next))) return 0;
             if (g_pinned) return 0;              // 已固定到屏幕，失焦也不收
+            // 刚显示出来的那一刻可能附带一次"未激活"（SetForegroundWindow 失败时必然如此），
+            // 忽略它，否则面板会一闪就没
+            if (GetTickCount64() - g_showTick < 250) return 0;
             g_autoHideTick = GetTickCount64();
             HidePopup();
         }
@@ -946,6 +999,21 @@ static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SIZE:
         LayoutPopup(h);               // 展示时窗口尺寸确定后再摆一次，避免溢出/错位
         return 0;
+    case WM_NCHITTEST: {
+        // 无标题栏的面板：客户区空白处当标题栏用，按住即可拖动；子控件区域不受影响
+        LRESULT hit = DefWindowProcW(h, m, w, l);
+        return (hit == HTCLIENT) ? HTCAPTION : hit;
+    }
+    case WM_MOVE:
+        // 记住拖到的新位置，下次点托盘图标时还弹在这里（而不是跳回图标旁）
+        if (g_popupShown) {
+            RECT rc;
+            GetWindowRect(h, &rc);
+            g_anchor.x = rc.right;
+            g_anchor.y = rc.bottom;
+            g_anchorValid = true;
+        }
+        break;
     case WM_SETTINGCHANGE:
         if (l && !wcscmp((const wchar_t*)l, L"ImmersiveColorSet")) {
             RefreshTheme(h);
@@ -1051,6 +1119,7 @@ static void ShowPopup(bool activate = true) {
     SetWindowPos(g_popup, HWND_TOPMOST, x, y, w, h,
                  SWP_SHOWWINDOW | (activate ? 0u : SWP_NOACTIVATE));
     g_popupShown = true;
+    g_showTick = GetTickCount64();
     if (activate) SetForegroundWindow(g_popup);
     // 窗口可见后再同步一次主题（WCA/AllowDark 对隐藏窗口可能不生效）
     SyncDarkMode(g_popup);
