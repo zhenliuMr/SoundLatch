@@ -1,8 +1,14 @@
 import os, struct, sys, json
 
-PAK = r'E:/Steam/steamapps/common/PUBG/TslGame/Content/Paks/pakchunk0-WindowsNoEditor_sound.pak'
-OUT = r'D:/project/PUBG/samples/wem'
+# 游戏安装路径因人而异，可用环境变量 PUBG_PAK 覆盖；
+# 默认试常见的 Steam 路径。输出目录相对脚本自身定位。
+PAK = os.environ.get('PUBG_PAK', r'E:/Steam/steamapps/common/PUBG/TslGame/Content/Paks/pakchunk0-WindowsNoEditor_sound.pak')
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT = os.path.join(ROOT, 'samples', 'wem')
 os.makedirs(OUT, exist_ok=True)
+
+if not os.path.exists(PAK):
+    sys.exit('找不到 pak 文件：%s\n请设置环境变量 PUBG_PAK 指向 pakchunk0-WindowsNoEditor_sound.pak' % PAK)
 
 f = open(PAK, 'rb', buffering=0)
 f.seek(0, 2); SIZE = f.tell(); f.seek(0)
@@ -42,5 +48,5 @@ while pos < SIZE:
     pos = base + CH - OVER
     if pos <= base: break
 
-json.dump(carved, open(r'D:/project/PUBG/samples/carved.json', 'w'), indent=0)
+json.dump(carved, open(os.path.join(ROOT, 'samples', 'carved.json'), 'w'), indent=0)
 print('carved', count)

@@ -3,10 +3,12 @@ import numpy as np
 from scipy.io import wavfile
 from scipy import signal
 
-WEM = r'D:/project/PUBG/samples/wem'
-CLI = r'D:/project/PUBG/tools/vgm/vgmstream-cli.exe'
-TMP = r'D:/project/PUBG/samples/tmp.wav'
-OUTCSV = r'D:/project/PUBG/samples/features.json'
+# 路径相对脚本自身定位，克隆到任何位置都能跑（原先硬编码 D:/project/PUBG）
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WEM = os.path.join(ROOT, 'samples', 'wem')
+CLI = os.path.join(ROOT, 'tools', 'vgm', 'vgmstream-cli.exe')
+TMP = os.path.join(ROOT, 'samples', 'tmp.wav')
+OUTCSV = os.path.join(ROOT, 'samples', 'features.json')
 
 files = sorted(os.listdir(WEM))
 step = max(1, len(files) // 700)
