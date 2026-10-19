@@ -1,0 +1,19 @@
+# .rc 必须是 UTF-8 with BOM —— windres 靠它识别编码；
+# 且不能被 git 做行尾转换（BOM 后的换行风格变化会让部分 windres 版本解析异常）
+res/*.rc      text eol=lf
+
+# .bat / .ps1 / .cmd 走 CRLF，且这些文件必须是纯 ASCII
+# （cmd.exe 按系统 ANSI 代码页读，非 ASCII 注释字节会破坏命令行解析）
+*.bat        text eol=crlf
+*.ps1        text eol=crlf
+*.cmd        text eol=crlf
+
+# 源码与文档统一 LF
+*.cpp        text eol=lf
+*.h          text eol=lf
+*.py         text eol=lf
+*.js         text eol=lf
+*.md         text eol=lf
+*.ico        binary
+*.png        binary
+*.res        binary

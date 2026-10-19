@@ -28,3 +28,6 @@ desktop.ini
 # local toolchain artifacts
 *.zip
 .workbuddy/
+
+# 编译中间产物（.gitattributes 里标为 binary，但要确保不进版本库）
+res/app.res
