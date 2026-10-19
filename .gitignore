@@ -14,6 +14,8 @@ tools/vgm/
 *.wav
 *.wem
 *.png
+# 例外：README 引用的素材必须入库，否则 GitHub 上显示不出图片
+!docs/assets/*.png
 
 # third-party driver installer (downloaded at build time, not our code)
 dist/vbcable/
