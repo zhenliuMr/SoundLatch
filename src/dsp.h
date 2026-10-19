@@ -1,4 +1,4 @@
-// dsp.h - SoundLock DSP core (interleaved stereo float32)
+// dsp.h - SoundLatch DSP core (interleaved stereo float32)
 // Realtime-safe: no allocation / locking / exceptions inside Process().
 //
 // Structure:

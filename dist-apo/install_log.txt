@@ -1,4 +1,0 @@
-02:19:51  === SoundLock APO install ===
-02:19:51  host: PowerShell 7.6.7 (Core)
-02:19:51  admin=False
-02:19:51  ERROR: administrator rights required
