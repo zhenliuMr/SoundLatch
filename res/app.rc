@@ -1,3 +1,42 @@
 #include <windows.h>
+
+// 版本号与 README / GitHub Release 保持同步
+#define SL_VER_MAJOR 1
+#define SL_VER_MINOR 2
+#define SL_VER_PATCH 0
+#define SL_VER_STR   "1.2.0"
+#define SL_BUILD_STR "2026-10-19"
+
 1 RT_MANIFEST "app.manifest"
 1 ICON "app.ico"
+
+// VERSIONINFO：让 exe 属性、任务管理器、"关于"面板都能看到真实版本。
+// 之前完全没有这个块，属性里只有空文件名。
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    SL_VER_MAJOR,SL_VER_MINOR,SL_VER_PATCH,0
+PRODUCTVERSION SL_VER_MAJOR,SL_VER_MINOR,SL_VER_PATCH,0
+FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+FILEFLAGS      0
+FILEOS         VOS_NT_WINDOWS32
+FILETYPE       VFT_APP
+FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"                      // 简体中文 · Unicode
+        BEGIN
+            VALUE "CompanyName",      "SoundLatch"
+            VALUE "FileDescription",  "PUBG 音频后处理器 · 降低环境音/强化脚步声 + 输出限幅"
+            VALUE "FileVersion",      SL_VER_STR
+            VALUE "InternalName",     "SoundLatch"
+            VALUE "LegalCopyright",   ""
+            VALUE "OriginalFilename", "SoundLatch.exe"
+            VALUE "ProductName",      "SoundLatch"
+            VALUE "ProductVersion",   SL_VER_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END
