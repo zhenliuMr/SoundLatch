@@ -5,12 +5,19 @@
 #include <commctrl.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <dwmapi.h>
+#include <uxtheme.h>
 #include <string>
 #include <vector>
 #include <cstdio>
+#include <cstdarg>
 #include <cmath>
 #include "dsp.h"
 #include "engine.h"
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -18,9 +25,9 @@
 using namespace sl;
 
 #define WM_TRAYICON (WM_APP + 1)
+#define WM_SHOWPOPUP (WM_APP + 2)
 #define IDI_APP 1
 #define IDM_POPUP   1
-#define IDM_SETTINGS 2
 #define IDM_QUIT    3
 
 // ----------------------------------------------------------------- ids
@@ -28,16 +35,21 @@ enum {
     IDC_A = 101, IDC_B = 102,
     IDC_ENVAMT = 110, IDC_ENVTHR = 111, IDC_STEPAMT = 112, IDC_STEPSENS = 113,
     IDC_CEIL = 114,
-    IDC_CAP = 120, IDC_REN = 121, IDC_LOOPBACK = 122, IDC_REFRESH = 123,
-    IDC_START = 124, IDC_BYPASS = 125,
-    IDC_METER = 130, IDC_STATUS = 131
+    IDC_CAP = 120, IDC_REN = 121, IDC_LOOPBACK = 122, IDC_RESET = 124, IDC_AUTOSTART = 125, IDC_PIN = 126,
+    IDC_METER = 130
 };
 
 static HINSTANCE g_hinst;
-static HWND g_hwnd;                  // settings
-static HWND g_popup;                 // tray popup
+static HWND g_hwnd;                  // 隐藏的消息窗口（托盘/定时器宿主）
+static HWND g_popup;                 // 唯一可见的界面：托盘弹窗
+// 弹窗锚点：最近一次点击托盘图标的位置（右下角对齐它），没点过就退回到图标矩形
+static POINT g_anchor{};
+static bool  g_anchorValid = false;
+static bool  g_popupShown = false;          // 面板是否处于展开状态（唯一状态源）
+static ULONGLONG g_autoHideTick = 0;        // 因失焦自动收起的时刻
 static HWND g_hA, g_hB, g_hEnvAmt, g_hEnvThr, g_hStepAmt, g_hStepSens, g_hCeil;
-static HWND g_hCap, g_hRen, g_hLoop, g_hRefresh, g_hStart, g_hBypass, g_hStatus, g_hMeter;
+static HWND g_hCap, g_hRen, g_hLoop, g_hReset, g_hMeter, g_hAuto, g_hPin;
+static bool g_pinned = false;   // 固定到屏幕：失焦也不收起
 static HWND g_hLblEnvAmt, g_hLblEnvThr, g_hLblStepAmt, g_hLblStepSens, g_hLblCeil;
 
 static DspCore g_dsp;
@@ -47,23 +59,30 @@ static std::vector<DeviceInfo> g_caps, g_rens;
 static bool g_running = false;
 static bool g_quit = false;
 
-static ULONGLONG g_lastCpu = 0, g_lastT = 0;
-static float g_cpuPct = 0.f;
-static float g_peakDisp = 0.f;
-static wchar_t g_statusText[256] = L"已停止";
+static void slLog(const wchar_t* fmt, ...);
+static void HidePopup();
+// 电平表（0..1 = 标尺比例，见 kMeterMinDb/kMeterMaxDb）
+static float g_meterLevel = 0.f;    // 平滑后的输入电平
 
 static HFONT g_fTitle, g_fLabel, g_fValue, g_fBtn, g_fSmall;
+static HFONT g_fIcon;      // 图标字体（Segoe Fluent Icons / MDL2），用于恢复默认按钮
 static HFONT g_pTitle, g_pLabel, g_pSmall, g_pBtn;   // popup (scaled)
 static HICON g_icoBig = nullptr, g_icoSmall = nullptr;
 static UINT  g_taskbarCreated = 0;
 
 // ----------------------------------------------------------------- theme
+// 深浅色下所有控件/文字都由系统绘制，代码只负责：
+//   1) 打开 uxtheme 的 ForceDark（让原生控件变深色）
+//   2) 自绘部分（电平表、静态标签底色、滑杆）跟随 g_th
+//   3) 主题切换时刷新
 struct Theme {
     bool light;
-    COLORREF bg, card, text, sub, track, accent, border, green, amber, red;
+    COLORREF bg, card, text, sub, track, accent, border, green, amber, red, field;
 };
 static Theme g_th;
-static HBRUSH g_brBg = nullptr;
+static HBRUSH g_brBg = nullptr;        // 窗口客户区底色
+static HBRUSH g_brCard = nullptr;      // 标签底色（与 bg 同色，让静态控件不显突兀）
+static HBRUSH g_brField = nullptr;     // 输入类控件（下拉框编辑框/列表）底色
 
 static bool ReadThemeFlag(const wchar_t* name, bool def) {
     HKEY k = nullptr;
@@ -88,44 +107,196 @@ static bool AppsIsLight() {     // 应用主题
 static void MakeTheme() {
     g_th.light = AppsIsLight();
     if (g_th.light) {
-        g_th.bg     = RGB(255, 255, 255);
-        g_th.card   = RGB(245, 246, 248);
-        g_th.text   = RGB(26, 28, 32);
-        g_th.sub    = RGB(110, 116, 126);
-        g_th.track  = RGB(226, 229, 234);
-        g_th.accent = RGB(47, 111, 237);
-        g_th.border = RGB(221, 224, 230);
-        g_th.green  = RGB(28, 150, 100);
-        g_th.amber  = RGB(186, 118, 12);
-        g_th.red    = RGB(198, 52, 52);
+        g_th.bg     = RGB(243, 243, 243);
+        g_th.card   = RGB(243, 243, 243);
+        g_th.text   = RGB(32, 32, 32);
+        g_th.sub    = RGB(96, 96, 96);
+        g_th.track  = RGB(120, 120, 120);
+        g_th.accent = RGB(0, 120, 215);
+        g_th.border = RGB(200, 200, 200);
+        g_th.field  = RGB(255, 255, 255);
+        g_th.green  = RGB(16, 124, 16);
+        g_th.amber  = RGB(197, 89, 17);
+        g_th.red    = RGB(196, 43, 28);
     } else {
-        g_th.bg     = RGB(30, 32, 37);
-        g_th.card   = RGB(39, 42, 49);
-        g_th.text   = RGB(233, 235, 239);
-        g_th.sub    = RGB(152, 158, 168);
-        g_th.track  = RGB(58, 62, 72);
-        g_th.accent = RGB(91, 140, 255);
-        g_th.border = RGB(56, 60, 70);
-        g_th.green  = RGB(58, 200, 140);
-        g_th.amber  = RGB(230, 172, 74);
-        g_th.red    = RGB(226, 92, 92);
+        g_th.bg     = RGB(32, 32, 32);
+        g_th.card   = RGB(32, 32, 32);
+        g_th.text   = RGB(255, 255, 255);
+        g_th.sub    = RGB(200, 200, 200);
+        g_th.track  = RGB(130, 130, 130);
+        g_th.accent = RGB(0, 120, 215);
+        g_th.border = RGB(80, 80, 80);
+        g_th.field  = RGB(51, 51, 51);
+        g_th.green  = RGB(0, 200, 90);
+        g_th.amber  = RGB(240, 180, 60);
+        g_th.red    = RGB(240, 90, 80);
     }
     if (g_brBg) DeleteObject(g_brBg);
+    if (g_brCard) DeleteObject(g_brCard);
+    if (g_brField) DeleteObject(g_brField);
     g_brBg = CreateSolidBrush(g_th.bg);
+    g_brCard = CreateSolidBrush(g_th.card);
+    g_brField = CreateSolidBrush(g_th.field);
+}
+
+// WM_CTLCOLORBTN / WM_CTLCOLOREDIT / WM_CTLCOLORLISTBOX 统一上色：
+// 按钮文字/勾选框文字用窗口底色；下拉框编辑区与下拉列表用 field 底色。
+static LRESULT DarkCtlColor(HDC dc, UINT msg) {
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, g_th.text);
+    if (msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORLISTBOX) {
+        SetBkColor(dc, g_th.field);
+        return (LRESULT)g_brField;
+    }
+    SetBkColor(dc, g_th.bg);
+    return (LRESULT)g_brBg;
+}
+
+// 通知 DWM 该窗口走深色（原生控件主题由系统绘制，必须靠这个属性才会变深色）
+static void ApplyDarkMode(HWND h) {
+    if (!h || !IsWindow(h)) return;
+    BOOL dark = AppsIsLight() ? FALSE : TRUE;
+    HRESULT h1 = DwmSetWindowAttribute(h, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    if (FAILED(h1)) DwmSetWindowAttribute(h, 19, &dark, sizeof(dark));
+    // 1903+（尤其 24H2/25H2）AllowDarkModeForWindow(133) 已失效，
+    // 正确做法是用 SetWindowCompositionAttribute + WCA_USEDARKMODECOLORS(26)
+    using fnSCA = BOOL(WINAPI*)(HWND, void*);
+    static fnSCA pfn = (fnSCA)GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                                             "SetWindowCompositionAttribute");
+    if (pfn) {
+        struct { DWORD a; PVOID p; SIZE_T c; } d{ 26 /*WCA_USEDARKMODECOLORS*/, &dark, sizeof(dark) };
+        pfn(h, &d);
+    }
+}
+
+// ComCtl32 v6 的控件由系统绘制，DWMWA 属性只管标题栏。
+// 25H2 实测有效链路：
+//   SetPreferredAppMode(AllowDark)                uxtheme 全局策略（含 MessageBox/菜单）
+//   DWMWA_USE_IMMERSIVE_DARK_MODE + WCA(26)      每个顶层窗口
+//   SetWindowTheme("Explorer") / ("CFD")         逐个 Button / ComboBox+Edit
+//   WM_CTLCOLORSTATIC 返回不透明深色刷           复选框底色的关键（它发的不是 BTN！）
+//   WM_CTLCOLORBTN/EDIT/LISTBOX                  按钮与下拉框文字/背景
+//   FlushMenuThemes + RefreshImmersiveColorPolicyState  策略/菜单刷新
+// 序数：135=SetPreferredAppMode  133=AllowDarkModeForWindow(25H2 已失效)
+//       136=FlushMenuThemes  104=RefreshImmersiveColorPolicyState
+static bool g_uxInit = false;
+static HRESULT (WINAPI* g_pfnPreferredAppMode)(int) = nullptr;
+static bool (WINAPI* g_pfnAllowDarkForWindow)(HWND, bool) = nullptr;
+static void (WINAPI* g_pfnFlushMenuThemes)() = nullptr;
+static void (WINAPI* g_pfnRefreshPolicy)() = nullptr;
+
+static void InitUxThemeApi() {
+    if (g_uxInit) return;
+    g_uxInit = true;
+    HMODULE ux = LoadLibraryW(L"uxtheme.dll");
+    if (!ux) return;
+    g_pfnPreferredAppMode   = (HRESULT(WINAPI*)(int))GetProcAddress(ux, (LPCSTR)135);
+    g_pfnAllowDarkForWindow = (bool(WINAPI*)(HWND, bool))GetProcAddress(ux, (LPCSTR)133);
+    g_pfnFlushMenuThemes    = (void(WINAPI*)())GetProcAddress(ux, (LPCSTR)136);
+    g_pfnRefreshPolicy      = (void(WINAPI*)())GetProcAddress(ux, (LPCSTR)104);
+}
+
+// 全局策略：0=Default(跟随系统) 1=AllowDark(允许深色，跟随系统) 2=ForceDark。
+// 调用后必须刷新策略与菜单缓存。
+static void SetAppDarkMode(bool dark) {
+    InitUxThemeApi();
+    if (g_pfnPreferredAppMode) g_pfnPreferredAppMode(dark ? 1 : 0);
+    if (g_pfnRefreshPolicy) g_pfnRefreshPolicy();
+    if (g_pfnFlushMenuThemes) g_pfnFlushMenuThemes();
+}
+
+// ---- 逐控件深色主题（win32-darkmode 标准做法，非自绘）----------------
+// 按钮/复选框：主题类仍为 "Explorer"，靠 AllowDarkModeForWindow(控件) 切深浅
+// 下拉框/编辑框：深色主题类为 "CFD"
+static void ApplyControlTheme(HWND h, bool dark) {
+    wchar_t cls[64] = L"";
+    if (!GetClassNameW(h, cls, 64)) return;
+    if (!_wcsicmp(cls, L"Button")) {
+        SetWindowTheme(h, L"Explorer", nullptr);
+        if (g_pfnAllowDarkForWindow) g_pfnAllowDarkForWindow(h, dark);
+        SendMessageW(h, WM_THEMECHANGED, 0, 0);
+    } else if (!_wcsicmp(cls, L"ComboBox") || !_wcsicmp(cls, L"Edit")) {
+        SetWindowTheme(h, dark ? L"CFD" : nullptr, nullptr);
+        if (g_pfnAllowDarkForWindow) g_pfnAllowDarkForWindow(h, dark);
+        SendMessageW(h, WM_THEMECHANGED, 0, 0);
+    } else return;
+    // trackbar 走 NM_CUSTOMDRAW 自绘，无需主题类
+}
+
+static BOOL CALLBACK ControlThemeEnum(HWND h, LPARAM lp) {
+    ApplyControlTheme(h, lp != 0);
+    return TRUE;
+}
+
+static void SyncDarkMode(HWND h) {
+    InitUxThemeApi();
+    bool dark = !AppsIsLight();
+    SetAppDarkMode(dark);
+    if (h && IsWindow(h)) {
+        ApplyDarkMode(h);
+        if (g_pfnAllowDarkForWindow) g_pfnAllowDarkForWindow(h, dark);
+        EnumChildWindows(h, ControlThemeEnum, (LPARAM)(dark ? 1 : 0));
+        RedrawWindow(h, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    }
+    slLog(L"theme: dark=%d api=%d hwnd=%p", dark,
+          (g_pfnPreferredAppMode && g_pfnAllowDarkForWindow) ? 1 : 0, (void*)h);
+}
+
+static void RefreshTheme(HWND h) {
+    MakeTheme();
+    SyncDarkMode(h);
+    if (IsWindow(h)) {
+        // 类背景刷也要跟着主题换，否则系统垫底永远是浅色
+        SetClassLongPtrW(h, GCLP_HBRBACKGROUND, (LONG_PTR)g_brBg);
+        RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
 }
 
 // ----------------------------------------------------------------- layout units
 static float g_scale = 1.0f;
+static int CALLBACK FontEnumCb(const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM lp) {
+    *(bool*)lp = true;
+    return 0;
+}
+static bool FontExists(const wchar_t* face) {
+    HDC dc = GetDC(nullptr);
+    LOGFONTW lf{};
+    lf.lfCharSet = DEFAULT_CHARSET;
+    wcscpy_s(lf.lfFaceName, face);
+    bool found = false;
+    EnumFontFamiliesExW(dc, &lf, FontEnumCb, (LPARAM)&found, 0);
+    ReleaseDC(nullptr, dc);
+    return found;
+}
 static inline int S(int v) { return (int)(v * g_scale + 0.5f); }
 static inline RECT R4(int x, int y, int w, int h) {
     RECT r{ S(x), S(y), S(x + w), S(y + h) };
     return r;
 }
 
-static const int kLeft = 18, kWidth = 520;
-
 // ----------------------------------------------------------------- helpers
-static void SyncPopup();
+static void slLog(const wchar_t* fmt, ...) {
+    static HANDLE f = nullptr;
+    if (!f) {
+        wchar_t p[MAX_PATH];
+        GetTempPathW(MAX_PATH, p);
+        wcscat_s(p, L"soundlatch_theme.log");
+        f = CreateFileW(p, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+    if (!f || f == INVALID_HANDLE_VALUE) return;
+    wchar_t buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vswprintf(buf, 512, fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        DWORD wr;
+        WriteFile(f, buf, (DWORD)wcslen(buf) * 2, &wr, nullptr);
+        WriteFile(f, L"\r\n", 4, &wr, nullptr);
+    }
+}
 static void SetFont(HWND h, HFONT f) { SendMessageW(h, WM_SETFONT, (WPARAM)f, TRUE); }
 
 static void FillR(HDC dc, RECT r, COLORREF c) {
@@ -169,6 +340,30 @@ static HWND SliderCtl(int i) {
 static int SliderPos(int i) { return (int)SendMessageW(SliderCtl(i), TBM_GETPOS, 0, 0); }
 static void SliderSet(int i, int v) { SendMessageW(SliderCtl(i), TBM_SETPOS, TRUE, v); }
 
+// ---- 电平表 / 限幅阈值共用的一条 dB 标尺 ----
+// 柱形与游标都用它换算：左端 -60 dBFS，右端 0 dBFS（数字满刻度，不再留余量）。
+static constexpr float kMeterMinDb = -60.0f;
+static constexpr float kMeterMaxDb =   0.0f;
+
+// ---- 限幅阈值（最大输出）滑杆的取值域 ----
+// 语义：这就是"当前允许的最大输出音量"——高于它的峰值被压到这条线，低于它的原样通过。
+//   位置 0       = 静音（真·0 输出）
+//   位置 1..1000 = -18 .. 0 dBFS（1% = -18 dBFS，100% = 0 dBFS 不限制）
+// 下限只到 -18 dBFS：再低就只剩"整体变小"，听感差异用系统扬声器音量调更直观。
+static constexpr float kCeilMuteDb = -120.0f;                   // 位置 0 用的静音值
+static constexpr float kCeilMinDb  = -18.0f;
+static constexpr int   kCeilPosMax = 1000;
+static inline float CeilPosToDb(int pos) {
+    if (pos <= 0) return kCeilMuteDb;
+    float db = kCeilMinDb + (float)(pos - 1) / (float)(kCeilPosMax - 1) * (0.0f - kCeilMinDb);
+    return roundf(db * 10.0f) / 10.0f;                          // 量化到 0.1 dB
+}
+static inline int CeilDbToPos(float db) {
+    if (db <= kCeilMuteDb + 1.0f) return 0;
+    int p = (int)lroundf((db - kCeilMinDb) / (0.0f - kCeilMinDb) * (float)(kCeilPosMax - 1) + 1.0f);
+    return p < 1 ? 1 : (p > kCeilPosMax ? kCeilPosMax : p);
+}
+
 static void FormatValue(int i, wchar_t* b, int n) {
     int p = SliderPos(i);
     switch (i) {
@@ -176,7 +371,13 @@ static void FormatValue(int i, wchar_t* b, int n) {
     case 1: swprintf(b, n, L"%d dBFS", -60 + p); break;
     case 2: swprintf(b, n, L"+%d dB", (p * 12 + 50) / 100); break;
     case 3: swprintf(b, n, L"%d%%", p); break;
-    case 4: swprintf(b, n, L"%.1f dBFS", -24.0f + p / 10.0f); break;
+    case 4:
+        if (p <= 0) swprintf(b, n, L"静音");
+        else {
+            int pct = (p < 10) ? 1 : (p + 5) / 10;   // 位置 1 就是 1%（= -18 dBFS），别显示成 0%
+            swprintf(b, n, L"%d%%", pct);
+        }
+        break;
     }
 }
 
@@ -189,18 +390,28 @@ static std::wstring AppDataPath() {
     return p + L"\\config.ini";
 }
 
+// 参数快照：PushParams 里随时更新。写配置只读它，不依赖控件是否还活着
+// （弹窗是主窗口的 owned window，退出时会被先拆掉，那时再去问控件只能得到 0）。
+static struct SavedState {
+    bool valid = false;
+    int  a = 1, b = 1;
+    int  envAmt = 55, envThr = 18, stepAmt = 65, stepSens = 70, ceil = 950;
+    int  capSel = -1, renSel = -1;
+    int  loop = 0;
+    int  pin = 0;
+} g_saved;
+
 static void SaveConfig() {
+    if (!g_saved.valid) return;
     FILE* f = _wfopen(AppDataPath().c_str(), L"w");
     if (!f) return;
     fprintf(f, "a_on=%d\nb_on=%d\nenv_amt=%d\nenv_thr=%d\nstep_amt=%d\nstep_sens=%d\nceil=%d\n",
-            (int)SendMessageW(g_hA, BM_GETCHECK, 0, 0) == BST_CHECKED,
-            (int)SendMessageW(g_hB, BM_GETCHECK, 0, 0) == BST_CHECKED,
-            SliderPos(0), SliderPos(1), SliderPos(2), SliderPos(3), SliderPos(4));
-    if (!g_caps.empty() && SendMessageW(g_hCap, CB_GETCURSEL, 0, 0) != CB_ERR)
-        fprintf(f, "cap_sel=%d\n", (int)SendMessageW(g_hCap, CB_GETCURSEL, 0, 0));
-    if (!g_rens.empty() && SendMessageW(g_hRen, CB_GETCURSEL, 0, 0) != CB_ERR)
-        fprintf(f, "ren_sel=%d\n", (int)SendMessageW(g_hRen, CB_GETCURSEL, 0, 0));
-    fprintf(f, "loopback=%d\n", (int)SendMessageW(g_hLoop, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            g_saved.a, g_saved.b, g_saved.envAmt, g_saved.envThr,
+            g_saved.stepAmt, g_saved.stepSens, g_saved.ceil);
+    if (g_saved.capSel >= 0) fprintf(f, "cap_sel=%d\n", g_saved.capSel);
+    if (g_saved.renSel >= 0) fprintf(f, "ren_sel=%d\n", g_saved.renSel);
+    fprintf(f, "loopback=%d\n", g_saved.loop);
+    fprintf(f, "pin=%d\n", g_saved.pin);
     fclose(f);
 }
 
@@ -222,6 +433,7 @@ static void LoadConfig() {
         else if (!strcmp(k, "cap_sel")) capSel = v;
         else if (!strcmp(k, "ren_sel")) renSel = v;
         else if (!strcmp(k, "loopback")) SendMessageW(g_hLoop, BM_SETCHECK, v ? BST_CHECKED : BST_UNCHECKED, 0);
+        else if (!strcmp(k, "pin")) { g_pinned = (v != 0); g_saved.pin = v ? 1 : 0; }
     }
     fclose(f);
     if (capSel >= 0 && capSel < (int)g_caps.size()) SendMessageW(g_hCap, CB_SETCURSEL, capSel, 0);
@@ -240,21 +452,84 @@ static void UpdateLabels() {
 }
 
 static void PushParams() {
+    g_saved.valid    = true;
+    g_saved.a        = (int)SendMessageW(g_hA, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    g_saved.b        = (int)SendMessageW(g_hB, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    g_saved.loop     = (int)SendMessageW(g_hLoop, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    g_saved.envAmt   = SliderPos(0);
+    g_saved.envThr   = SliderPos(1);
+    g_saved.stepAmt  = SliderPos(2);
+    g_saved.stepSens = SliderPos(3);
+    g_saved.ceil     = SliderPos(4);
+    {
+        int ci = (int)SendMessageW(g_hCap, CB_GETCURSEL, 0, 0);
+        int ri = (int)SendMessageW(g_hRen, CB_GETCURSEL, 0, 0);
+        if (ci != CB_ERR) g_saved.capSel = ci;
+        if (ri != CB_ERR) g_saved.renSel = ri;
+    }
+
     g_params.aOn      = SendMessageW(g_hA, BM_GETCHECK, 0, 0) == BST_CHECKED;
     g_params.bOn      = SendMessageW(g_hB, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    g_params.bypass   = SendMessageW(g_hBypass, BM_GETCHECK, 0, 0) == BST_CHECKED;
     g_params.envAmt   = SliderPos(0) / 100.0f;
     g_params.envThrDb = -60.0f + (float)SliderPos(1);
     g_params.stepAmt  = SliderPos(2) / 100.0f;
     g_params.stepSens = SliderPos(3) / 100.0f;
-    g_params.ceilDb   = -24.0f + SliderPos(4) / 10.0f;
+    g_params.ceilDb   = CeilPosToDb(SliderPos(4));
     g_dsp.SetParams(g_params);
     UpdateLabels();
-    SyncPopup();
     if (g_popup) InvalidateRect(g_popup, nullptr, FALSE);
 }
 
+// ---- 开机自启：写/删 HKCU\Software\Microsoft\Windows\CurrentVersion\Run 下的 SoundLatch 项 ----
+static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t* kRunVal = L"SoundLatch";
+
+static bool AutoStartEnabled() {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS) return false;
+    wchar_t buf[MAX_PATH * 2]{};
+    DWORD cb = sizeof(buf);
+    bool on = RegQueryValueExW(k, kRunVal, nullptr, nullptr, (BYTE*)buf, &cb) == ERROR_SUCCESS;
+    RegCloseKey(k);
+    return on;
+}
+
+static void SetAutoStart(bool on) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
+    if (on) {
+        wchar_t exe[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring v = L"\"" + std::wstring(exe) + L"\"";
+        RegSetValueExW(k, kRunVal, 0, REG_SZ, (const BYTE*)v.c_str(),
+                       (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(k, kRunVal);
+    }
+    RegCloseKey(k);
+}
+
+// 恢复默认参数
+static void ResetDefaults() {
+    SendMessageW(g_hA, BM_SETCHECK, BST_CHECKED, 0);
+    SendMessageW(g_hB, BM_SETCHECK, BST_CHECKED, 0);
+    SliderSet(0, 55);
+    SliderSet(1, 18);
+    SliderSet(2, 65);
+    SliderSet(3, 70);
+    SliderSet(4, 950);
+    for (int i = 0; i < 5; ++i) InvalidateRect(SliderCtl(i), nullptr, FALSE);
+    PushParams();
+}
+
+// 枚举设备。已有选择时按设备 id 记住并恢复（热插拔后不会跳回默认）
 static void FillCombos() {
+    std::wstring keepCap, keepRen;
+    int ci0 = (int)SendMessageW(g_hCap, CB_GETCURSEL, 0, 0);
+    if (ci0 >= 0 && ci0 < (int)g_caps.size()) keepCap = g_caps[ci0].id;
+    int ri0 = (int)SendMessageW(g_hRen, CB_GETCURSEL, 0, 0);
+    if (ri0 >= 0 && ri0 < (int)g_rens.size()) keepRen = g_rens[ri0].id;
+
     g_caps = AudioEngine::EnumCapture();
     g_rens = AudioEngine::EnumRender();
 
@@ -282,21 +557,10 @@ static void FillCombos() {
     }
     for (size_t i = 0; i < g_rens.size(); ++i)
         SendMessageW(g_hRen, CB_ADDSTRING, 0, (LPARAM)g_rens[i].name.c_str());
+    for (size_t i = 0; i < g_caps.size(); ++i) if (!keepCap.empty() && g_caps[i].id == keepCap) capDef = (int)i;
+    for (size_t i = 0; i < g_rens.size(); ++i) if (!keepRen.empty() && g_rens[i].id == keepRen) renDef = (int)i;
     if (!g_caps.empty()) SendMessageW(g_hCap, CB_SETCURSEL, capDef, 0);
     if (!g_rens.empty()) SendMessageW(g_hRen, CB_SETCURSEL, renDef, 0);
-}
-
-static void UpdateStatus(const wchar_t* extra = nullptr) {
-    if (!g_running) {
-        swprintf(g_statusText, 256, L"状态：已停止%s%s", extra ? L" · " : L"", extra ? extra : L"");
-    } else {
-        swprintf(g_statusText, 256, L"运行中 · 延迟 %.1f ms · 欠载 %d · CPU %.1f%%",
-                 g_engine.LatencyMs(), g_engine.Underruns(), g_cpuPct);
-    }
-    if (g_hStatus) {
-        SetWindowTextW(g_hStatus, g_statusText);
-        InvalidateRect(g_hStatus, nullptr, TRUE);
-    }
 }
 
 static void StartEngine(bool silent = false) {
@@ -305,6 +569,7 @@ static void StartEngine(bool silent = false) {
     int ci = (int)SendMessageW(g_hCap, CB_GETCURSEL, 0, 0);
     int ri = (int)SendMessageW(g_hRen, CB_GETCURSEL, 0, 0);
     if (ri < 0 || ri >= (int)g_rens.size()) {
+        slLog(L"engine start skipped: bad render sel ri=%d n=%d", ri, (int)g_rens.size());
         if (!silent) MessageBoxW(g_hwnd, L"请先选择输出设备（你的耳机）。", L"SoundLatch", MB_ICONWARNING);
         return;
     }
@@ -325,6 +590,8 @@ static void StartEngine(bool silent = false) {
     g_dsp.Prepare(48000.0f);
     PushParams();
     if (!g_engine.Start(capId, g_rens[ri].id, loop, &g_dsp, err)) {
+        slLog(L"engine start FAILED: cap=%s ren=%s loop=%d err=%s",
+              capId.c_str(), g_rens[ri].name.c_str(), loop ? 1 : 0, err.c_str());
         if (!silent) {
             std::wstring msg = L"启动失败：" + err;
             MessageBoxW(g_hwnd, msg.c_str(), L"SoundLatch", MB_ICONERROR);
@@ -332,18 +599,20 @@ static void StartEngine(bool silent = false) {
         return;
     }
     g_running = true;
-    SetWindowTextW(g_hStart, L"停止");
-    UpdateStatus();
-    SyncPopup();
+    slLog(L"engine started: cap=%s ren=%s loop=%d lat=%.1fms",
+          capId.c_str(), g_rens[ri].name.c_str(), loop ? 1 : 0, g_engine.LatencyMs());
 }
 
 static void StopEngine() {
     if (!g_running) return;
     g_engine.Stop();
     g_running = false;
-    SetWindowTextW(g_hStart, L"启动");
-    UpdateStatus();
-    SyncPopup();
+}
+
+// 设备/回环/刷新等变更后自动（重新）启动，保持「打开即启用」
+static void AutoRestart() {
+    if (g_running) StopEngine();
+    StartEngine(true);
 }
 
 // ----------------------------------------------------------------- tray
@@ -354,13 +623,12 @@ static void TrayAdd() {
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = (HICON)LoadImageW(g_hinst, MAKEINTRESOURCEW(SystemIsLight() ? 2 : 3),
+    // 托盘图标不分深浅色，统一用应用图标（带底色的那版）
+    nid.hIcon = (HICON)LoadImageW(g_hinst, MAKEINTRESOURCEW(IDI_APP),
                                   IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
                                   GetSystemMetrics(SM_CYSMICON), 0);
-    wcscpy_s(nid.szTip, L"SoundLatch · 脚步增强 / 音量限幅");
+    wcscpy_s(nid.szTip, L"SoundLatch · 脚步增强 / 音量限幅   build " __DATE__ L" " __TIME__);
     Shell_NotifyIconW(NIM_ADD, &nid);
-    nid.uVersion = NOTIFYICON_VERSION_4;
-    Shell_NotifyIconW(NIM_SETVERSION, &nid);
 }
 static void TrayRemove() {
     NOTIFYICONDATAW nid{};
@@ -384,128 +652,334 @@ static RECT TrayRect() {
 }
 
 
-static HWND g_pA, g_pB, g_pByp, g_pStart, g_pSet, g_pMeter, g_pStatus;
-static HWND g_pSl[4], g_pLbl[4];
-static const int    g_pIdx[4]   = { 0, 1, 2, 4 };   // envAmt, envThr, stepAmt, ceil
 static const wchar_t* g_slName[5] = { L"环境抑制", L"环境阈值", L"脚步增强", L"瞬态灵敏度", L"最大输出" };
+static HWND g_hLblCap, g_hLblRen;
 
-// 弹窗 -> 设置窗口
-static void PushFromPopup() {
-    SendMessageW(g_hA, BM_SETCHECK, SendMessageW(g_pA, BM_GETCHECK, 0, 0), 0);
-    SendMessageW(g_hB, BM_SETCHECK, SendMessageW(g_pB, BM_GETCHECK, 0, 0), 0);
-    SendMessageW(g_hBypass, BM_SETCHECK, SendMessageW(g_pByp, BM_GETCHECK, 0, 0), 0);
-    for (int k = 0; k < 4; ++k) {
-        SliderSet(g_pIdx[k], (int)SendMessageW(g_pSl[k], TBM_GETPOS, 0, 0));
-    }
-    PushParams();
+// ---- 自适应布局：先测内容尺寸定窗口，再用真实 client 宽高摆控件 ----
+static int MeasureText(HWND h, HFONT f, const wchar_t* s) {
+    HDC dc = GetDC(h);
+    HFONT old = (HFONT)SelectObject(dc, f);
+    SIZE sz{0, 0};
+    GetTextExtentPoint32W(dc, s, (int)wcslen(s), &sz);
+    SelectObject(dc, old);
+    ReleaseDC(h, dc);
+    return sz.cx;
 }
 
-// 设置窗口 -> 弹窗
-static void SyncPopup() {
-    if (!g_popup) return;
-    SendMessageW(g_pA, BM_SETCHECK, SendMessageW(g_hA, BM_GETCHECK, 0, 0), 0);
-    SendMessageW(g_pB, BM_SETCHECK, SendMessageW(g_hB, BM_GETCHECK, 0, 0), 0);
-    SendMessageW(g_pByp, BM_SETCHECK, SendMessageW(g_hBypass, BM_GETCHECK, 0, 0), 0);
+static void LayoutPopupIn(HWND h, int cw, int ch) {
+    if (!h || cw <= 0 || ch <= 0) return;
+    if (!g_hA || !g_hB || !g_hMeter || !g_hCap || !g_hRen) return;
+
+    const int pad = S(14);
+    const int kW  = cw - pad * 2;
+    const int ind = S(10);
+    int y = S(10);
+
+    MoveWindow(g_hA, pad, y, kW, S(24), TRUE);
+    y += S(28);
+
+    HWND sl[4] = { g_hEnvAmt, g_hEnvThr, g_hStepAmt, g_hStepSens };
+    HWND lb[4] = { g_hLblEnvAmt, g_hLblEnvThr, g_hLblStepAmt, g_hLblStepSens };
     for (int k = 0; k < 4; ++k) {
-        int idx = g_pIdx[k];
-        SendMessageW(g_pSl[k], TBM_SETPOS, TRUE, SliderPos(idx));
-        wchar_t val[64];
-        FormatValue(idx, val, 64);
-        std::wstring t = std::wstring(g_slName[idx]) + L"   " + val;
-        SetWindowTextW(g_pLbl[k], t.c_str());
+        MoveWindow(lb[k], pad + ind, y, kW - ind, S(18), TRUE);
+        MoveWindow(sl[k], pad + ind, y + S(18), kW - ind * 2, S(24), TRUE);
+        y += S(44);
     }
-    SetWindowTextW(g_pStart, g_running ? L"停止" : L"启动");
+
+    MoveWindow(g_hB, pad, y, kW, S(24), TRUE);
+    y += S(28);
+
+    MoveWindow(g_hLblCeil, pad + ind, y, kW - ind, S(18), TRUE);
+    MoveWindow(g_hCeil, pad + ind, y + S(18), kW - ind * 2, S(24), TRUE);
+    y += S(18) + S(24) + S(5);            // 电平柱紧贴滑杆下沿，同属限幅这一组
+    MoveWindow(g_hMeter, pad + ind, y, kW - ind * 2, S(24), TRUE);
+    y += S(24) + S(10);
+
+    MoveWindow(g_hLblCap, pad, y, kW, S(16), TRUE);
+    y += S(18);
+    MoveWindow(g_hCap, pad, y, kW, 240, TRUE);
+    y += S(30);
+    MoveWindow(g_hLblRen, pad, y, kW, S(16), TRUE);
+    y += S(18);
+    MoveWindow(g_hRen, pad, y, kW, 240, TRUE);
+    y += S(30);
+
+    // 底行：回环捕获 · 开机自启动 · 恢复默认(图标按钮)
+    const int bs = S(24);
+    MoveWindow(g_hReset, pad + kW - bs, y, bs, bs, TRUE);
+    MoveWindow(g_hPin, pad + kW - bs * 2 - S(6), y, bs, bs, TRUE);
+    const int rest = kW - bs * 2 - S(16);
+    MoveWindow(g_hLoop, pad, y, rest / 2, bs, TRUE);
+    MoveWindow(g_hAuto, pad + rest / 2, y, rest / 2, bs, TRUE);
+}
+
+static void PopupContentSize(HWND h, int& cw, int& ch) {
+    const int pad = S(14);
+    int w = MeasureText(h, g_fBtn, L"降低环境音 + 强化脚步声") + S(26);
+    int w2 = MeasureText(h, g_fBtn, L"锁定最大输出音量") + S(26);
+    if (w2 > w) w = w2;
+    for (int i = 0; i < 5; ++i) {
+        wchar_t t[96];
+        const wchar_t* ph = (i == 4) ? L"100%" : (i == 1 ? L"-60 dBFS" : L"100 %");
+        swprintf(t, 96, L"%s   %s", g_slName[i], ph);
+        int lw = MeasureText(h, g_fLabel, t) + S(30);
+        if (lw > w) w = lw;
+    }
+    int lw2 = MeasureText(h, g_fLabel, L"采集") + S(10);
+    if (lw2 > w) w = lw2;
+    if (w < S(250)) w = S(250);
+
+    cw = w + pad * 2;
+    ch = S(10) + S(28) + S(44) * 4 + S(28) + S(18) + S(24) + S(5) + S(24) + S(10)
+       + S(18) + S(30) + S(18) + S(30) + S(22) + S(10);
+}
+
+// 基于当前真实 client 尺寸重排（窗口被缩放时也走这里）
+static void LayoutPopup(HWND h) {
+    if (!h) return;
+    RECT rc;
+    if (!GetClientRect(h, &rc)) return;
+    LayoutPopupIn(h, rc.right - rc.left, rc.bottom - rc.top);
+}
+
+// ----------------------------------------------------------------- slider custom draw
+// ComCtl32 的 trackbar 在暗色主题下凹槽/滑块仍是浅色，必须自己画。
+// 注意：必须在 CDDS_PREPAINT 整块画完并返回 SKIPDEFAULT。
+// 如果放到 CDDS_ITEMPREPAINT 按 item 画，拖动时系统只把"旧滑块/新滑块"的小矩形
+// 放进重绘区：轨道不会被重画 -> 拖影；14px 的滑块又被裁进原生 item 矩形 -> 变窄。
+static LRESULT DrawSlider(HWND sl, NMCUSTOMDRAW* cd) {
+    if (cd->dwDrawStage != CDDS_PREPAINT) return CDRF_DODEFAULT;
+
+    int pos = (int)SendMessageW(sl, TBM_GETPOS, 0, 0);
+    int lo  = (int)SendMessageW(sl, TBM_GETRANGEMIN, 0, 0);
+    int hi  = (int)SendMessageW(sl, TBM_GETRANGEMAX, 0, 0);
+    if (hi <= lo) hi = lo + 1;
+    double frac = (double)(pos - lo) / (double)(hi - lo);
+    if (frac < 0) frac = 0;
+    if (frac > 1) frac = 1;
+
+    RECT rc;
+    GetClientRect(sl, &rc);
+    HDC dc = cd->hdc;
+    FillR(dc, rc, g_th.bg);                       // 先铺底，把旧滑块彻底擦掉
+
+    int th = S(4);
+    int ty = rc.top + ((rc.bottom - rc.top) - th) / 2;
+    int tw = S(14);
+    int usable = (rc.right - rc.left) - tw;
+    if (usable < 1) usable = 1;
+    int tx = (int)(frac * usable);
+
+    // 轨道底色
+    HBRUSH bTrack = CreateSolidBrush(g_th.track);
+    RECT tr{rc.left, ty, rc.right, ty + th};
+    FillRect(dc, &tr, bTrack);
+    DeleteObject(bTrack);
+
+    // 已填充段
+    if (tx > 0) {
+        HBRUSH bA = CreateSolidBrush(g_th.accent);
+        RECT fr{rc.left, ty, rc.left + tx + tw / 2, ty + th};
+        FillRect(dc, &fr, bA);
+        DeleteObject(bA);
+    }
+
+    // 滑块（圆角矩形 + 浅色描边，暗色下才有对比）
+    RECT gr{rc.left + tx, ty - S(4), rc.left + tx + tw, ty + th + S(4)};
+    HBRUSH bG = CreateSolidBrush(g_th.accent);
+    HPEN pEdge = CreatePen(PS_SOLID, 1, g_th.light ? RGB(255, 255, 255) : RGB(20, 22, 26));
+    HGDIOBJ ob = SelectObject(dc, bG), op = SelectObject(dc, pEdge);
+    RoundRect(dc, gr.left, gr.top, gr.right, gr.bottom, S(4), S(4));
+    SelectObject(dc, ob); SelectObject(dc, op);
+    DeleteObject(bG); DeleteObject(pEdge);
+    return CDRF_SKIPDEFAULT;
 }
 
 static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CREATE: {
-        int kLeft = 14, kW = 332;
-        int y = 10;
-        g_pA = CreateWindowExW(0, L"BUTTON", L"① 降低环境音 + 强化脚步声",
-                               WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                               kLeft, y, kW, 24, h, (HMENU)201, g_hinst, nullptr);
-        SetFont(g_pA, g_fBtn);
-        y += 30;
-        for (int k = 0; k < 3; ++k) {          // 环境抑制 / 环境阈值 / 脚步增强
-            g_pLbl[k] = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                                        kLeft + 10, y, 240, 20, h, nullptr, g_hinst, nullptr);
-            SetFont(g_pLbl[k], g_fLabel);
-            g_pSl[k] = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
-                                       WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
-                                       kLeft + 10, y + 20, kW - 20, 26, h, (HMENU)(300 + k), g_hinst, nullptr);
-            y += 52;
-        }
-        g_pB = CreateWindowExW(0, L"BUTTON", L"② 锁定最大输出音量（限幅）",
-                               WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                               kLeft, y, kW, 24, h, (HMENU)202, g_hinst, nullptr);
-        SetFont(g_pB, g_fBtn);
-        y += 30;
-        g_pLbl[3] = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                                    kLeft + 10, y, 240, 20, h, nullptr, g_hinst, nullptr);
-        SetFont(g_pLbl[3], g_fLabel);
-        g_pSl[3] = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
-                                   WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
-                                   kLeft + 10, y + 20, kW - 20, 26, h, (HMENU)303, g_hinst, nullptr);
-        y += 56;
-        g_pMeter = CreateWindowExW(0, L"SLMETER", L"", WS_CHILD | WS_VISIBLE,
-                                   kLeft, y, kW, 24, h, (HMENU)204, g_hinst, nullptr);
-        y += 30;
-        g_pStart = CreateWindowExW(0, L"BUTTON", L"启动", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                   kLeft, y, 90, 30, h, (HMENU)205, g_hinst, nullptr);
-        SetFont(g_pStart, g_fBtn);
-        g_pByp = CreateWindowExW(0, L"BUTTON", L"旁通(A/B)", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                 kLeft + 100, y, 100, 30, h, (HMENU)206, g_hinst, nullptr);
-        SetFont(g_pByp, g_fLabel);
-        g_pSet = CreateWindowExW(0, L"BUTTON", L"设置…", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                 kLeft + 210, y, 90, 30, h, (HMENU)207, g_hinst, nullptr);
-        SetFont(g_pSet, g_fLabel);
-        y += 38;
-        g_pStatus = CreateWindowExW(0, L"STATIC", L"已停止",
-                                    WS_CHILD | WS_VISIBLE | SS_SIMPLE | SS_NOPREFIX,
-                                    kLeft, y, kW, 20, h, nullptr, g_hinst, nullptr);
-        SetFont(g_pStatus, g_fLabel);
+        SyncDarkMode(h);          // 必须在子控件创建之前，否则控件按旧主题定型
 
-        for (int k = 0; k < 4; ++k) {
-            int idx = g_pIdx[k];
-            int hi = (idx == 1) ? 42 : (idx == 4 ? 240 : 100);
-            SendMessageW(g_pSl[k], TBM_SETRANGE, TRUE, MAKELONG(0, hi));
-            SendMessageW(g_pSl[k], TBM_SETPOS, TRUE, SliderPos(idx));
+        auto mkLabel = [&](const wchar_t* txt) {
+            HWND lb2 = CreateWindowExW(0, L"STATIC", txt, WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
+                                       0, 0, 100, S(16), h, nullptr, g_hinst, nullptr);
+            SetFont(lb2, g_fLabel);
+            return lb2;
+        };
+        auto mkSlider = [&](int id, int lo, int hi, int pos) {
+            HWND sl = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
+                                      WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
+                                      0, 0, 100, S(24), h, (HMENU)id, g_hinst, nullptr);
+            SendMessageW(sl, TBM_SETRANGE, TRUE, MAKELONG(lo, hi));
+            SendMessageW(sl, TBM_SETPOS, TRUE, pos);
+            return sl;
+        };
+
+        g_hA = CreateWindowExW(0, L"BUTTON", L"降低环境音 + 强化脚步声",
+                               WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                               0, 0, 100, S(24), h, (HMENU)IDC_A, g_hinst, nullptr);
+        SetFont(g_hA, g_fBtn);
+        SendMessageW(g_hA, BM_SETCHECK, BST_CHECKED, 0);
+
+        g_hLblEnvAmt   = mkLabel(L"");
+        g_hEnvAmt      = mkSlider(IDC_ENVAMT, 0, 100, 55);
+        g_hLblEnvThr   = mkLabel(L"");
+        g_hEnvThr      = mkSlider(IDC_ENVTHR, 0, 42, 18);
+        g_hLblStepAmt  = mkLabel(L"");
+        g_hStepAmt     = mkSlider(IDC_STEPAMT, 0, 100, 65);
+        g_hLblStepSens = mkLabel(L"");
+        g_hStepSens    = mkSlider(IDC_STEPSENS, 0, 100, 70);
+
+        g_hB = CreateWindowExW(0, L"BUTTON", L"锁定最大输出音量",
+                               WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                               0, 0, 100, S(24), h, (HMENU)IDC_B, g_hinst, nullptr);
+        SetFont(g_hB, g_fBtn);
+        SendMessageW(g_hB, BM_SETCHECK, BST_CHECKED, 0);
+
+        g_hLblCeil = mkLabel(L"");
+        g_hCeil    = mkSlider(IDC_CEIL, 0, kCeilPosMax, 950);
+        g_hMeter   = CreateWindowExW(0, L"SLMETER", L"", WS_CHILD | WS_VISIBLE,
+                                     0, 0, 100, S(24), h, (HMENU)IDC_METER, g_hinst, nullptr);
+
+        g_hLblCap = mkLabel(L"采集");
+        g_hCap = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                                 0, 0, 100, 240, h, (HMENU)IDC_CAP, g_hinst, nullptr);
+        SetFont(g_hCap, g_fLabel);
+        g_hLblRen = mkLabel(L"输出");
+        g_hRen = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                                 0, 0, 100, 240, h, (HMENU)IDC_REN, g_hinst, nullptr);
+        SetFont(g_hRen, g_fLabel);
+
+        g_hLoop = CreateWindowExW(0, L"BUTTON", L"回环捕获", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                  0, 0, 100, S(22), h, (HMENU)IDC_LOOPBACK, g_hinst, nullptr);
+        SetFont(g_hLoop, g_fLabel);
+        g_hAuto = CreateWindowExW(0, L"BUTTON", L"开机自启动", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                  0, 0, 100, S(22), h, (HMENU)IDC_AUTOSTART, g_hinst, nullptr);
+        SetFont(g_hAuto, g_fLabel);
+        {   // 状态以注册表为准；若已开启，顺手把路径更新成当前 exe（程序被移动过也不会失效）
+            bool on = AutoStartEnabled();
+            SendMessageW(g_hAuto, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+            if (on) SetAutoStart(true);
         }
-        SyncPopup();
+        g_hReset = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                                   0, 0, S(22), S(22), h, (HMENU)IDC_RESET, g_hinst, nullptr);
+        g_hPin = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                                 0, 0, S(22), S(22), h, (HMENU)IDC_PIN, g_hinst, nullptr);
+
+        FillCombos();
+        LoadConfig();
+        PushParams();
+        LayoutPopup(h);          // 字体已就位，按实测内容定窗口尺寸
+        StartEngine(true);       // 控件就绪、设备已选好，这时才能真正开流
+        SyncDarkMode(h);         // 子控件已全部创建，逐个挂深色主题类
+        SetTimer(h, 1, 33, nullptr);
         return 0;
     }
     case WM_CTLCOLORSTATIC: {
+        // 复选框/单选钮发送的是 WM_CTLCOLORSTATIC（不是 BTN），
+        // 必须返回不透明的深色刷，否则控件底色保持类默认的白色
         HDC dc = (HDC)w;
-        SetBkMode(dc, TRANSPARENT);
-        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        SetBkMode(dc, OPAQUE);
+        SetBkColor(dc, g_th.bg);
+        SetTextColor(dc, g_th.text);
+        return (LRESULT)g_brBg;
     }
+    case WM_CTLCOLORBTN:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+        return DarkCtlColor((HDC)w, m);
+    case WM_NOTIFY: {
+        NMHDR* nh = (NMHDR*)l;
+        if (nh->code == NM_CUSTOMDRAW && nh->idFrom >= IDC_ENVAMT && nh->idFrom <= IDC_CEIL)
+            return DrawSlider(nh->hwndFrom, (NMCUSTOMDRAW*)l);
+        break;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* di = (DRAWITEMSTRUCT*)l;
+        if (di->CtlID == IDC_RESET || di->CtlID == IDC_PIN) {
+            FillR(di->hDC, di->rcItem, g_th.bg);
+            bool pressed = (di->itemState & ODS_SELECTED) != 0;
+            bool on = (di->CtlID == IDC_PIN) && g_pinned;      // 固定状态用强调色
+            SetBkMode(di->hDC, TRANSPARENT);
+            SetTextColor(di->hDC, (pressed || on) ? g_th.accent : g_th.text);
+            HGDIOBJ of = SelectObject(di->hDC, g_fIcon ? g_fIcon : g_fBtn);
+            RECT r = di->rcItem;
+            if (pressed) OffsetRect(&r, S(1), S(1));
+            DrawTextW(di->hDC, di->CtlID == IDC_PIN ? L"" : L"", -1, &r,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(di->hDC, of);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_ERASEBKGND: {
+        RECT* pr = (RECT*)l;
+        if (!pr) return 1;
+        FillR((HDC)w, *pr, g_th.bg);
+        return 1;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        FillR(dc, rc, g_th.bg);       // 客户区底色始终由自己垫，不依赖系统 erase
+        HBRUSH bd = CreateSolidBrush(g_th.border);
+        FrameRect(dc, &rc, bd);       // 无标题栏，画一圈细边框
+        DeleteObject(bd);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_ACTIVATE:
+        if (LOWORD(w) == WA_INACTIVE) {
+            // 激活到别处 -> 收起。组合框展开的下拉列表是本窗口的子窗口，不算
+            HWND next = (HWND)l;
+            if (!next) next = GetForegroundWindow();
+            if (next == h || (next && IsChild(h, next))) return 0;
+            if (g_pinned) return 0;              // 已固定到屏幕，失焦也不收
+            g_autoHideTick = GetTickCount64();
+            HidePopup();
+        }
+        return 0;
+    case WM_SIZE:
+        LayoutPopup(h);               // 展示时窗口尺寸确定后再摆一次，避免溢出/错位
+        return 0;
+    case WM_SETTINGCHANGE:
+        if (l && !wcscmp((const wchar_t*)l, L"ImmersiveColorSet")) {
+            RefreshTheme(h);
+            return 0;
+        }
+        break;
     case WM_HSCROLL:
-        PushFromPopup();
+        if (l) InvalidateRect((HWND)l, nullptr, FALSE);   // 整条滑杆重画，杜绝拖动残影
+        PushParams();
         return 0;
     case WM_COMMAND: {
         int id = LOWORD(w);
-        if (id == 201 || id == 202 || id == 206) {
-            PushFromPopup();
-        } else if (id == 205) {
-            if (g_running) StopEngine(); else StartEngine(true);
+        if (id == IDC_A || id == IDC_B) {
+            PushParams();
+        } else if (id == IDC_LOOPBACK) {
+            PushParams();
+            AutoRestart();
+        } else if (id == IDC_AUTOSTART) {
+            SetAutoStart(SendMessageW(g_hAuto, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        } else if (id == IDC_PIN) {
+            g_pinned = !g_pinned;
+            g_saved.pin = g_pinned ? 1 : 0;
+            InvalidateRect(g_hPin, nullptr, FALSE);
+            if (g_pinned) SetWindowPos(g_popup, HWND_TOPMOST, 0, 0, 0, 0,
+                                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             SaveConfig();
-        } else if (id == 207) {
-            ShowWindow(h, SW_HIDE);
-            ShowWindow(g_hwnd, SW_SHOW);
-            SetForegroundWindow(g_hwnd);
+        } else if (id == IDC_RESET) {
+            ResetDefaults();
+        } else if (HIWORD(w) == CBN_SELCHANGE && (id == IDC_CAP || id == IDC_REN)) {
+            AutoRestart();                       // 切换设备后自动重连
         }
         return 0;
     }
     case WM_TIMER:
         if (w == 1) {
-            if (g_pMeter) InvalidateRect(g_pMeter, nullptr, FALSE);
-            wchar_t b[256];
-            if (g_running) swprintf(b, 256, L"%.0f ms · 欠载 %d · CPU %.0f%%",
-                                    g_engine.LatencyMs(), g_engine.Underruns(), g_cpuPct);
-            else swprintf(b, 256, L"未运行 · 点击「启动」开始");
-            SetWindowTextW(g_pStatus, b);
-            InvalidateRect(g_pStatus, nullptr, TRUE);
+            if (g_hMeter) InvalidateRect(g_hMeter, nullptr, FALSE);
             return 0;
         }
         return 0;
@@ -516,256 +990,311 @@ static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-static void ShowPopup() {
-    if (!g_popup) {
-        g_popup = CreateWindowExW(WS_EX_TOOLWINDOW, L"SoundLatchPopup", L"SoundLatch 控制面板",
-                                  WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                                  0, 0, S(360), S(450), g_hwnd, nullptr, g_hinst, nullptr);
+static void HidePopup() {
+    static bool reentering = false;      // ShowWindow(SW_HIDE) 会同步回 WM_ACTIVATE，防递归
+    if (reentering) return;
+    if (!g_popup || !IsWindow(g_popup)) { g_popupShown = false; return; }
+    if (!g_popupShown && !IsWindowVisible(g_popup)) return;
+    reentering = true;
+    g_popupShown = false;                // 先改状态，再隐藏
+    ShowWindow(g_popup, SW_HIDE);
+    SaveConfig();                        // 收起面板就落盘，避免被强制结束进程时丢参数
+    reentering = false;
+}
+
+// activate=false 用于开机自动弹出：不抢焦点
+// 只创建窗口（不显示）：控件、设备枚举、引擎启动都在 WM_CREATE 里完成
+static bool EnsurePopup() {
+    if (g_popup && IsWindow(g_popup)) return true;
+    const DWORD st = WS_POPUP | WS_CLIPCHILDREN;
+    g_popup = CreateWindowExW(WS_EX_TOOLWINDOW, L"SoundLatchPopup", L"SoundLatch 控制面板",
+                              st, 0, 0, S(320), S(320), g_hwnd, nullptr, g_hinst, nullptr);
+    if (!g_popup) return false;
+    DWORD corner = 2;                              // Win11 圆角面板 DWMWCP_ROUND
+    DwmSetWindowAttribute(g_popup, 33, &corner, sizeof(corner));
+    SetTimer(g_popup, 1, 33, nullptr);
+    return true;
+}
+
+static void ShowPopup(bool activate = true) {
+    const DWORD st = WS_POPUP | WS_CLIPCHILDREN;   // 不裁子控件 -> 每次重绘刷到控件上，拖动时闪
+    if (!EnsurePopup()) { g_popupShown = false; return; }
+
+    // 只测一次内容尺寸 -> 推出窗口尺寸
+    int cw = 0, ch = 0;
+    PopupContentSize(g_popup, cw, ch);
+    RECT wr{0, 0, cw, ch};
+    AdjustWindowRectEx(&wr, st, FALSE, WS_EX_TOOLWINDOW);
+    int w = wr.right - wr.left, h = wr.bottom - wr.top;
+
+    // 右下角锚定到点击位置：面板从这里向左上展开，贴边时再夹回工作区
+    POINT pt;
+    if (g_anchorValid) {
+        pt = g_anchor;
+    } else {
+        RECT tr = TrayRect();                 // 开机自动弹出时没有点击点，用图标矩形右下角
+        pt.x = tr.right;
+        pt.y = tr.bottom;
     }
-    RECT tr = TrayRect();
     RECT wa;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-    int w = S(360), h = S(450);
-    int x = (int)tr.left - w / 2;
-    int y = (int)tr.top - h - S(8);
-    if (x + w > wa.right - S(8)) x = wa.right - w - S(8);
+    int x = pt.x - w;                         // 右边缘对齐点击点
+    int y = pt.y - h - S(6);                  // 底边略高于点击点，不压住图标
     if (x < wa.left + S(8)) x = wa.left + S(8);
+    if (x + w > wa.right - S(8)) x = wa.right - w - S(8);
     if (y < wa.top + S(8)) y = wa.top + S(8);
-    SetWindowPos(g_popup, HWND_TOP, x, y, w, h, SWP_SHOWWINDOW);
-    SetForegroundWindow(g_popup);
-    SyncPopup();
+    if (y + h > wa.bottom - S(8)) y = wa.bottom - h - S(8);
+
+    // HWND_TOPMOST：托盘展开浮窗是 topmost 的，普通窗口会被压在它下面
+    SetWindowPos(g_popup, HWND_TOPMOST, x, y, w, h,
+                 SWP_SHOWWINDOW | (activate ? 0u : SWP_NOACTIVATE));
+    g_popupShown = true;
+    if (activate) SetForegroundWindow(g_popup);
+    // 窗口可见后再同步一次主题（WCA/AllowDark 对隐藏窗口可能不生效）
+    SyncDarkMode(g_popup);
+    // 窗口尺寸定好后再按真实 client 尺寸摆控件，避免溢出/错位
+    FillCombos();               // 每次打开都重新枚举设备（热插拔/换耳机不用手动刷新）
+    LayoutPopup(g_popup);
+    slLog(L"ShowPopup: at %d,%d win %dx%d client %dx%d", x, y, w, h, cw, ch);
 }
 
 // ----------------------------------------------------------------- meter
+// 标尺：kMeterMinDb .. kMeterMaxDb 线性映射到 0..1（常量在文件上方与限幅阈值共用）。
+// 右端就是 0 dBFS（满刻度），不留余量。
+static constexpr float kMeterRelease = 0.55f;   // 回落速度（标尺比例/秒，约 36 dB/s）
+
+static inline float Clamp01f(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
+
+static float MeterNormDb(float db) {
+    return Clamp01f((db - kMeterMinDb) / (kMeterMaxDb - kMeterMinDb));
+}
+static float MeterNormLin(float lin) {
+    return MeterNormDb(20.0f * log10f(lin + 1e-7f));
+}
+
+// 每帧推进柱形：瞬时上冲、缓慢回落
+static void MeterTick() {
+    static ULONGLONG lastMs = 0;
+    ULONGLONG now = GetTickCount64();
+    float dt = lastMs ? (float)(now - lastMs) / 1000.0f : 0.033f;
+    lastMs = now;
+    if (dt > 0.25f) dt = 0.25f;
+
+    float nrm = MeterNormLin(g_dsp.MeterInPeak());
+    if (nrm > g_meterLevel) g_meterLevel = nrm;                                  // attack: 立即
+    else g_meterLevel = nrm > g_meterLevel - kMeterRelease * dt
+                            ? nrm : g_meterLevel - kMeterRelease * dt;           // release
+}
+
+// ---- 渐变色 ----
+struct Col { int r, g, b; };
+static inline Col ColOf(COLORREF c) { return Col{ (int)GetRValue(c), (int)GetGValue(c), (int)GetBValue(c) }; }
+static inline Col MixC(Col a, Col b, float t) {
+    t = Clamp01f(t);
+    return Col{ (int)(a.r + (b.r - a.r) * t + 0.5f),
+                (int)(a.g + (b.g - a.g) * t + 0.5f),
+                (int)(a.b + (b.b - a.b) * t + 0.5f) };
+}
+static inline COLORREF ToCR(const Col& c) { return RGB(c.r, c.g, c.b); }
+// 32bpp DIB 的内存字节序是 B,G,R：DWORD = R<<16 | G<<8 | B（与 RGB() 宏相反）
+static inline DWORD DibCR(const Col& c) { return ((DWORD)c.r << 16) | ((DWORD)c.g << 8) | (DWORD)c.b; }
+
+// 位置 -> 颜色：绿 -> 黄 -> 橙 -> 红（RGB 宏的输出正好是 32bpp DIB 需要的 0x00BBGGRR）
+static Col MeterGrad(float t) {
+    t = Clamp01f(t);
+    Col gr = ColOf(g_th.green), am = ColOf(g_th.amber), rd = ColOf(g_th.red);
+    Col dim = g_th.light ? Col{255, 255, 255} : Col{0, 0, 0};
+    const int n = 6;
+    Col cs[n] = { MixC(gr, dim, 0.34f), gr, MixC(gr, am, 0.55f), am, MixC(am, rd, 0.45f), rd };
+    float ps[n] = { 0.00f, 0.35f, 0.62f, 0.80f, 0.91f, 1.00f };
+    if (t <= ps[0]) return cs[0];
+    for (int i = 1; i < n; ++i)
+        if (t <= ps[i]) return MixC(cs[i - 1], cs[i], (t - ps[i - 1]) / (ps[i] - ps[i - 1]));
+    return cs[n - 1];
+}
+
+// 在电平表上按住拖动 = 拖动限幅阈值（x 按标尺换算成 dB，直接写回天花板）
+static void SetCeilFromMeter(HWND h, int x) {
+    RECT rc;
+    GetClientRect(h, &rc);
+    int W = rc.right - rc.left;
+    if (W <= 0 || !g_hCeil) return;
+    float t  = Clamp01f((float)(x - rc.left) / (float)W);
+    int pos  = (t < 0.02f) ? 0                                   // 最左一小段 = 静音（拖到底）
+                           : CeilDbToPos(kMeterMinDb + t * (kMeterMaxDb - kMeterMinDb));
+    if (pos == SliderPos(4)) return;
+    SliderSet(4, pos);
+    if (g_hCeil) InvalidateRect(g_hCeil, nullptr, FALSE);
+    PushParams();
+}
+
 static LRESULT CALLBACK MeterProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_PAINT) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
         RECT rc;
         GetClientRect(h, &rc);
-        FillR(dc, rc, GetSysColor(COLOR_BTNFACE));
-        FrameRect(dc, &rc, GetSysColorBrush(COLOR_3DSHADOW));
+        FillR(dc, rc, g_th.bg);
 
-        int wdt = rc.right - rc.left;
-        float dbv = 20.0f * log10f(g_peakDisp + 1e-6f);
-        float norm = (dbv + 60.0f) / 60.0f;
-        if (norm < 0) norm = 0;
-        if (norm > 1) norm = 1;
-        RECT bar = rc;
-        bar.bottom -= S(4);
-        bar.right = rc.left + (LONG)(norm * wdt);
-        FillR(dc, bar, norm > 0.93f ? RGB(210, 70, 60) : (norm > 0.80f ? RGB(210, 170, 60) : RGB(64, 168, 110)));
+        const int pad = S(5);
+        RECT tr = rc;                                  // 槽
+        tr.top += pad; tr.bottom -= pad;
+        int W = tr.right - tr.left, H = tr.bottom - tr.top;
+
+        if (W > 4 && H > 3) {
+            Col grayed = MixC(ColOf(g_th.bg), ColOf(g_th.text), g_th.light ? 0.10f : 0.14f);
+            COLORREF trackBg = ToCR(grayed);
+            COLORREF edgeC = ToCR(MixC(ColOf(g_th.border), ColOf(g_th.text), g_th.light ? 0.15f : 0.10f));
+
+            // 直角槽：按需求不做圆角，填充、柱形、边框全是方角
+            FillR(dc, tr, trackBg);
+
+            // 参考刻度：-48 / -36 / -24 / -12 dBFS（0 dBFS 就是右边界）
+            {
+                const float tks[4] = { -48.f, -36.f, -24.f, -12.f };
+                for (int i = 0; i < 4; ++i) {
+                    int x = tr.left + (int)(MeterNormDb(tks[i]) * W + 0.5f);
+                    if (x >= tr.right - 1) x = tr.right - 1;
+                    FillR(dc, RECT{ x, tr.top, x + 1, tr.bottom },
+                          ToCR(MixC(grayed, ColOf(g_th.text), 0.22f)));
+                }
+            }
+
+            // ---- 柱形 ----
+            // 阈值 = 显示上限：柱形永远长不过游标，超出的部分只画虚影。
+            // 限幅打开时虚影是红色（在压），关闭时是灰色（只是超了上限，没在压）。
+            const bool limiting = g_params.bOn;
+            const float thrN    = MeterNormDb(g_params.ceilDb);
+            const float raw     = g_meterLevel;
+            const float body    = raw < thrN ? raw : thrN;
+            const float over    = raw > thrN ? raw : body;
+            int xBody  = (int)(body * W + 0.5f);
+            int xOver  = (int)(over * W + 0.5f);
+            if (xBody > W) xBody = W;
+            if (xOver > W) xOver = W;
+
+            Col redC  = MixC(MixC(ColOf(g_th.red), grayed, 0.30f), ColOf(g_th.red), 0.55f);
+            Col dimC  = MixC(grayed, ColOf(g_th.text), 0.30f);
+            // 静音位（阈值 = 0）时整条都是虚影，用灰色，别糊成一片红
+            Col overC = (limiting && thrN > 0.002f) ? redC : dimC;
+            std::vector<DWORD> bits((size_t)W * H);
+            for (int x = 0; x < W; ++x) {
+                float t = (W > 1) ? (float)x / (float)(W - 1) : 0.f;
+                Col base = MeterGrad(t);
+                if (x >= xOver) {
+                    for (int y = 0; y < H; ++y) bits[(size_t)y * W + x] = DibCR(grayed);
+                    continue;
+                }
+                Col c0 = (x >= xBody) ? overC : base;
+                for (int y = 0; y < H; ++y) {
+                    float vy = (H > 1) ? (float)y / (float)(H - 1) : 1.f;
+                    float k  = 0.74f + 0.26f * vy;                 // 上暗下亮：柱形的体积感
+                    bits[(size_t)y * W + x] = DibCR(Col{ (int)(c0.r * k + 0.5f),
+                                                         (int)(c0.g * k + 0.5f),
+                                                         (int)(c0.b * k + 0.5f) });
+                }
+            }
+            BITMAPINFOHEADER bi{};
+            bi.biSize = sizeof(bi);
+            bi.biWidth = W; bi.biHeight = -H;          // top-down
+            bi.biPlanes = 1; bi.biBitCount = 32; bi.biCompression = BI_RGB;
+            BITMAPINFO bmi{};
+            bmi.bmiHeader = bi;
+            SetDIBitsToDevice(dc, tr.left, tr.top, (DWORD)W, (DWORD)H, 0, 0, 0, (UINT)H,
+                              bits.data(), &bmi, DIB_RGB_COLORS);
+
+            SelectClipRgn(dc, nullptr);
+            HBRUSH eb = CreateSolidBrush(edgeC);
+            FrameRect(dc, &tr, eb);               // 方角边框，与填充贴合
+            DeleteObject(eb);
+
+            // ---- 限幅阈值：一条最普通的分割线，只有颜色随开关变 ----
+            {
+                int tx = tr.left + (int)(thrN * W + 0.5f);
+                if (tx > tr.right - 1) tx = tr.right - 1;
+                COLORREF c = limiting ? g_th.amber : ToCR(MixC(grayed, ColOf(g_th.text), 0.45f));
+                FillR(dc, RECT{ tx, tr.top, tx + 1, tr.bottom }, c);
+            }
+        }
         EndPaint(h, &ps);
         return 0;
+    }
+    if (m == WM_LBUTTONDOWN) {
+        SetCapture(h);
+        SetCeilFromMeter(h, GET_X_LPARAM(l));
+        return 0;
+    }
+    if (m == WM_MOUSEMOVE) {
+        if (GetCapture() == h) SetCeilFromMeter(h, GET_X_LPARAM(l));
+        return 0;
+    }
+    if (m == WM_LBUTTONUP) {
+        if (GetCapture() == h) ReleaseCapture();
+        return 0;
+    }
+    if (m == WM_SETCURSOR) {
+        SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));   // 提示可以横向拖动
+        return TRUE;
     }
     if (m == WM_ERASEBKGND) return 1;
     return DefWindowProcW(h, m, w, l);
 }
 
 // ----------------------------------------------------------------- settings window
+// 只负责托盘图标、定时器与退出；界面全在弹窗里
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-    case WM_CREATE: {
-        int y = 12;
-
-        HWND t = CreateWindowExW(0, L"STATIC", L"SoundLatch  ·  PUBG 音频后处理", WS_CHILD | WS_VISIBLE,
-                                 kLeft, y, kWidth, 24, h, nullptr, g_hinst, nullptr);
-        SetFont(t, g_fBtn);
-        y += 34;
-        g_hA = CreateWindowExW(0, L"BUTTON", L"① 开启：降低环境音 + 强化脚步声",
-                               WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                               kLeft, y, kWidth, 24, h, (HMENU)IDC_A, g_hinst, nullptr);
-        SetFont(g_hA, g_fBtn);
-        SendMessageW(g_hA, BM_SETCHECK, BST_CHECKED, 0);
-        y += 30;
-
-        auto mkSlider = [&](int id, int lo, int hi, int pos, int x, int yy, int wdt) {
-            HWND s = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
-                                     x, yy, wdt, 26, h, (HMENU)id, g_hinst, nullptr);
-            SendMessageW(s, TBM_SETRANGE, TRUE, MAKELONG(lo, hi));
-            SendMessageW(s, TBM_SETPOS, TRUE, pos);
-            return s;
-        };
-
-        g_hLblEnvAmt = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                                       kLeft + 12, y, 220, 20, h, nullptr, g_hinst, nullptr);
-        g_hEnvAmt = mkSlider(IDC_ENVAMT, 0, 100, 55, kLeft + 12, y + 20, kWidth - 40);
-        SetFont(g_hLblEnvAmt, g_fLabel);
-        y += 52;
-
-        g_hLblEnvThr = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                                       kLeft + 12, y, 220, 20, h, nullptr, g_hinst, nullptr);
-        g_hEnvThr = mkSlider(IDC_ENVTHR, 0, 42, 18, kLeft + 12, y + 20, kWidth - 40);
-        SetFont(g_hLblEnvThr, g_fLabel);
-        y += 52;
-
-        g_hLblStepAmt = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                                        kLeft + 12, y, 220, 20, h, nullptr, g_hinst, nullptr);
-        g_hStepAmt = mkSlider(IDC_STEPAMT, 0, 100, 65, kLeft + 12, y + 20, kWidth - 40);
-        SetFont(g_hLblStepAmt, g_fLabel);
-        y += 52;
-
-        g_hLblStepSens = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                                         kLeft + 12, y, 220, 20, h, nullptr, g_hinst, nullptr);
-        g_hStepSens = mkSlider(IDC_STEPSENS, 0, 100, 70, kLeft + 12, y + 20, kWidth - 40);
-        SetFont(g_hLblStepSens, g_fLabel);
-        y += 58;
-
-        g_hB = CreateWindowExW(0, L"BUTTON", L"② 开启：锁定最大输出音量（限幅）",
-                               WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                               kLeft, y, kWidth, 24, h, (HMENU)IDC_B, g_hinst, nullptr);
-        SetFont(g_hB, g_fBtn);
-        SendMessageW(g_hB, BM_SETCHECK, BST_CHECKED, 0);
-        y += 30;
-
-        g_hLblCeil = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-                                     kLeft + 12, y, 220, 20, h, nullptr, g_hinst, nullptr);
-        g_hCeil = mkSlider(IDC_CEIL, 0, 240, 210, kLeft + 12, y + 20, kWidth - 40);
-        SetFont(g_hLblCeil, g_fLabel);
-        y += 56;
-
-        HWND l1 = CreateWindowExW(0, L"STATIC", L"采集（CABLE Output）", WS_CHILD | WS_VISIBLE,
-                                  kLeft, y, 240, 20, h, nullptr, g_hinst, nullptr);
-        SetFont(l1, g_fLabel);
-        y += 22;
-        g_hCap = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                 kLeft, y, kWidth, 240, h, (HMENU)IDC_CAP, g_hinst, nullptr);
-        SetFont(g_hCap, g_fLabel);
-        y += 32;
-        HWND l2 = CreateWindowExW(0, L"STATIC", L"输出（你的耳机）", WS_CHILD | WS_VISIBLE,
-                                  kLeft, y, 240, 20, h, nullptr, g_hinst, nullptr);
-        SetFont(l2, g_fLabel);
-        y += 22;
-        g_hRen = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                 kLeft, y, kWidth, 240, h, (HMENU)IDC_REN, g_hinst, nullptr);
-        SetFont(g_hRen, g_fLabel);
-        y += 34;
-
-        g_hLoop = CreateWindowExW(0, L"BUTTON", L"回环捕获（未装 VB-Cable 时测试用）",
-                                  WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                  kLeft, y, 320, 22, h, (HMENU)IDC_LOOPBACK, g_hinst, nullptr);
-        SetFont(g_hLoop, g_fLabel);
-        g_hRefresh = CreateWindowExW(0, L"BUTTON", L"刷新", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                     kLeft + 400, y - 2, 60, 26, h, (HMENU)IDC_REFRESH, g_hinst, nullptr);
-        SetFont(g_hRefresh, g_fLabel);
-        y += 32;
-
-        g_hStart = CreateWindowExW(0, L"BUTTON", L"启动", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                   kLeft, y, 120, 32, h, (HMENU)IDC_START, g_hinst, nullptr);
-        SetFont(g_hStart, g_fBtn);
-        g_hBypass = CreateWindowExW(0, L"BUTTON", L"旁通(A/B)", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                    kLeft + 132, y, 120, 32, h, (HMENU)IDC_BYPASS, g_hinst, nullptr);
-        SetFont(g_hBypass, g_fLabel);
-        y += 40;
-
-        g_hMeter = CreateWindowExW(0, L"SLMETER", L"", WS_CHILD | WS_VISIBLE,
-                                   kLeft, y, kWidth, 24, h, (HMENU)IDC_METER, g_hinst, nullptr);
-        y += 30;
-        g_hStatus = CreateWindowExW(0, L"STATIC", L"状态：已停止",
-                                    WS_CHILD | WS_VISIBLE | SS_SIMPLE | SS_NOPREFIX,
-                                    kLeft, y, kWidth, 22, h, (HMENU)IDC_STATUS, g_hinst, nullptr);
-        SetFont(g_hStatus, g_fLabel);
-        y += 30;
-        HWND hint = CreateWindowExW(0, L"STATIC",
-                                    L"游戏输出→CABLE Input；本程序采集 CABLE Output→耳机。",
-                                    WS_CHILD | WS_VISIBLE | SS_SIMPLE | SS_NOPREFIX,
-                                    kLeft, y + 4, kWidth, 20, h, nullptr, g_hinst, nullptr);
-        SetFont(hint, g_fLabel);
-
-        FillCombos();
-        LoadConfig();
-        PushParams();
-        UpdateStatus();
-
-        SetTimer(h, 1, 60, nullptr);
-        SetTimer(h, 2, 250, nullptr);
+    case WM_SHOWPOPUP:
+        ShowPopup();
         return 0;
-    }
-    case WM_CTLCOLORSTATIC: {
-        HDC dc = (HDC)w;
-        SetBkMode(dc, OPAQUE);
-        SetBkColor(dc, GetSysColor(COLOR_BTNFACE));
-        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
-    }
-    case WM_SETTINGCHANGE:
-        if (l && !wcscmp((const wchar_t*)l, L"ImmersiveColorSet")) {
-            MakeTheme();
-            RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
-            if (g_popup) InvalidateRect(g_popup, nullptr, TRUE);
-        }
-        return 0;
-    case WM_HSCROLL:
-        PushParams();
-        return 0;
-    case WM_COMMAND: {
-        int id = LOWORD(w);
-        if (id == IDC_A || id == IDC_B || id == IDC_BYPASS) {
-            PushParams();
-        } else if (id == IDC_REFRESH) {
-            bool wasRunning = g_running;
-            StopEngine();
-            FillCombos();
-            if (wasRunning) StartEngine(true);
-        } else if (id == IDC_START) {
-            if (g_running) { StopEngine(); SaveConfig(); }
-            else StartEngine();
-        }
-        return 0;
-    }
-    case WM_TRAYICON: {
-        UINT ev = LOWORD(l);
-        if (ev == WM_LBUTTONUP || ev == NIN_SELECT || ev == NIN_KEYSELECT) {
-            if (g_popup && IsWindowVisible(g_popup)) ShowWindow(g_popup, SW_HIDE);
-            else ShowPopup();
-        } else if (ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU) {
+    case WM_TRAYICON:
+        // 只处理左键（开/收面板）和右键（菜单），没有其它版本语义需要兼容
+        if (l == WM_LBUTTONUP) {
+            if (GetTickCount64() - g_autoHideTick < 300) return 0;  // 这次点击就是让它失焦收起的那次
+            GetCursorPos(&g_anchor);          // 记下点击位置，弹窗以它为锚点
+            g_anchorValid = true;
+            if (g_popupShown) HidePopup();
+            else ShowPopup(true);
+        } else if (l == WM_RBUTTONUP) {
             POINT pt;
             GetCursorPos(&pt);
             HMENU menu = CreatePopupMenu();
             AppendMenuW(menu, MF_STRING, IDM_POPUP, L"控制面板");
-            AppendMenuW(menu, MF_STRING, IDM_SETTINGS, L"设置…");
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(menu, MF_STRING, IDM_QUIT, L"退出");
             SetForegroundWindow(h);
             int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, nullptr);
             DestroyMenu(menu);
-            if (cmd == IDM_POPUP) ShowPopup();
-            else if (cmd == IDM_SETTINGS) { ShowWindow(h, SW_SHOW); SetForegroundWindow(h); }
-            else if (cmd == IDM_QUIT) { g_quit = true; DestroyWindow(h); }
+            if (cmd == IDM_POPUP) {
+                g_anchor = pt;
+                g_anchorValid = true;
+                ShowPopup();
+            } else if (cmd == IDM_QUIT) {
+                g_quit = true;
+                SaveConfig();          // 必须先存：DestroyWindow 会先拆掉 owned 的弹窗
+                DestroyWindow(h);
+            }
         }
         return 0;
-    }
-    case WM_TIMER: {
+    case WM_TIMER:
         if (w == 1) {
-            g_peakDisp = g_dsp.MeterPeak();
+            MeterTick();
             if (g_hMeter) InvalidateRect(g_hMeter, nullptr, FALSE);
+            static int tick = 0;
+            if (g_running && ++tick % 1800 == 0)     // 每 ~60 s 记一次运行状态，便于排查
+                slLog(L"run: lat=%.1fms cap=%.1f ring=%.1f ren=%.1f lvl=%.3f under=%d",
+                      g_engine.LatencyMs(), g_engine.CapBufMs(), g_engine.RingMs(),
+                      g_engine.RenBufMs(), g_meterLevel, g_engine.Underruns());
             return 0;
         }
-        ULONGLONG now = GetTickCount64();
-        FILETIME ct, et, kt, ut;
-        if (GetProcessTimes(GetCurrentProcess(), &ct, &et, &kt, &ut)) {
-            ULONGLONG cpu = ((ULONGLONG)kt.dwHighDateTime << 32 | kt.dwLowDateTime) +
-                            ((ULONGLONG)ut.dwHighDateTime << 32 | ut.dwLowDateTime);
-            static ULONGLONG accCpu = 0, accT = 0;
-            if (g_lastT && now > g_lastT) {
-                accCpu += cpu - g_lastCpu;
-                accT += now - g_lastT;
-                if (accT >= 500) {
-                    g_cpuPct = (float)((double)accCpu / 10000.0 / (double)accT * 100.0);
-                    accCpu = 0; accT = 0;
-                }
-            }
-            g_lastCpu = cpu;
-            g_lastT = now;
+        if (w == 9) {                  // 启动后静默建好面板（不开窗），只为了把引擎跑起来
+            KillTimer(h, 9);
+            EnsurePopup();
+            return 0;
         }
-        UpdateStatus();
         return 0;
-    }
-    case WM_CLOSE:
-        if (!g_quit) { ShowWindow(h, SW_HIDE); return 0; }
-        break;
     case WM_DESTROY:
         KillTimer(h, 1);
-        KillTimer(h, 2);
         TrayRemove();
         StopEngine();
         SaveConfig();
@@ -781,7 +1310,28 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     SetProcessDPIAware();
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+
+    // 单实例：已有实例在跑就把它的面板叫到前台，否则重复启动会「看不见任何东西」
+    {
+        HANDLE h = CreateMutexW(nullptr, TRUE, L"Local\\SoundLatch_SingleInstance");
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            HWND prev = FindWindowW(L"SoundLatchWnd", nullptr);
+            if (prev) {
+                PostMessageW(prev, WM_APP + 2, 0, 0);   // 让已有实例弹出面板
+                CloseHandle(h);
+                return 0;
+            }
+        }
+    }
+
     MakeTheme();
+    // 必须在创建任何窗口/控件之前切好全局深色策略，
+    // 否则控件按浅色主题创建，之后再改只影响标题栏
+    SetAppDarkMode(!AppsIsLight());
+    slLog(L"startup: AppsIsLight=%d SystemIsLight=%d pfMode=%p pfAllow=%p pfFlush=%p pfRefresh=%p",
+          AppsIsLight() ? 1 : 0, SystemIsLight() ? 1 : 0,
+          (void*)g_pfnPreferredAppMode, (void*)g_pfnAllowDarkForWindow,
+          (void*)g_pfnFlushMenuThemes, (void*)g_pfnRefreshPolicy);
 
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
@@ -803,6 +1353,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     g_fValue = mkf(14, FW_SEMIBOLD, false);
     g_fBtn   = mkf(15, FW_SEMIBOLD, false);
     g_fSmall = mkf(12, FW_NORMAL, false);
+
+    // 图标字体：Win11 用 Fluent Icons，Win10 回退 MDL2（矢量字形，比 GDI 手绘清晰）
+    {
+        const wchar_t* icons = FontExists(L"Segoe Fluent Icons") ? L"Segoe Fluent Icons"
+                            : (FontExists(L"Segoe MDL2 Assets") ? L"Segoe MDL2 Assets" : nullptr);
+        if (icons)
+            g_fIcon = CreateFontW(-S(16), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                  DEFAULT_PITCH | FF_DONTCARE, icons);
+    }
     g_pTitle = mkf(15, FW_SEMIBOLD, true);
     g_pLabel = mkf(12, FW_NORMAL, true);
     g_pSmall = mkf(11, FW_NORMAL, true);
@@ -818,7 +1378,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = g_brBg;                 // 跟随主题的类背景刷
     wc.lpszClassName = L"SoundLatchWnd";
     wc.hIcon = g_icoBig;
     wc.hIconSm = g_icoSmall;
@@ -829,7 +1389,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     pc.lpfnWndProc = PopupProc;
     pc.hInstance = hInst;
     pc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    pc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    pc.hbrBackground = g_brBg;                 // 跟随主题的类背景刷
     pc.lpszClassName = L"SoundLatchPopup";
     RegisterClassExW(&pc);
 
@@ -841,17 +1401,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     mc.lpszClassName = L"SLMETER";
     RegisterClassExW(&mc);
 
-    RECT r{0, 0, kWidth + kLeft * 2, 735};
-    AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
+    // 隐藏的消息窗口：只做托盘图标与定时器的宿主，界面上不存在
     g_hwnd = CreateWindowExW(0, L"SoundLatchWnd", L"SoundLatch",
-                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-                             CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
-                             nullptr, nullptr, hInst, nullptr);
+                             WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, hInst, nullptr);
     if (!g_hwnd) return 1;
 
     TrayAdd();
-    // start in the tray, no window on screen
-    ShowWindow(g_hwnd, SW_HIDE);
+    SetTimer(g_hwnd, 1, 33, nullptr);   // 电平表 30 fps
+    // 托盘图标可能落在折叠区，双击后看不到任何东西会以为没启动。
+    // 延后到初始化全部完成、消息循环跑起来之后再弹面板。
+    SetTimer(g_hwnd, 9, 400, nullptr);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

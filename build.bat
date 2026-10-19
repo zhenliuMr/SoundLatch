@@ -10,8 +10,9 @@ if errorlevel 1 (
 )
 echo [2/2] compiling...
 g++ -std=c++20 -O2 -municode -mwindows -DUNICODE -D_UNICODE -Wall -Wno-unused-variable ^
+    -static -static-libgcc -static-libstdc++ ^
     src\main.cpp src\engine.cpp res\app.res -o dist\SoundLatch.exe ^
-    -lole32 -luuid -lcomctl32 -lpsapi -lavrt -lgdi32 -luser32 -lshlwapi
+    -lole32 -luuid -lcomctl32 -lpsapi -lavrt -lgdi32 -luser32 -lshlwapi -ldwmapi -luxtheme -ladvapi32
 if errorlevel 1 (
   echo BUILD FAILED
   exit /b 1

@@ -132,9 +132,35 @@ int main() {
         printf("      steady part peak %.5f (should be ~0)\n", s1);
     }
 
-    // ---- 5. realtime cost
+    // ---- 6. 分频段限幅：低频爆炸被压到上限，脚步带（1k）不受影响
     {
         DspCore d; d.Prepare((float)fs);
+        DspParams p; p.aOn = false; p.bOn = true; p.ceilDb = -6.f;
+        d.SetParams(p);
+        std::vector<float> buf(N * 2);
+        const int N3 = (int)(fs * 3.0);
+        buf.assign((size_t)N3 * 2, 0.f);
+        for (int i = 0; i < N3; ++i) {
+            double t = i / fs;
+            float foot = 0.03f * sinf(2 * 3.14159265f * 1000.f * (float)t);       // -30 dBFS
+            float boom = (t > 1.0 && t < 2.0) ? 0.9f * sinf(2 * 3.14159265f * 60.f * (float)t) : 0.f;
+            buf[2 * i] = buf[2 * i + 1] = foot + boom;
+        }
+        d.Process(buf.data(), N3);
+        float mx = 0; for (float v : buf) mx = std::max(mx, fabsf(v));
+        auto monoOut = mono(buf);
+        double a1 = goertzelAmp(monoOut, 1000.0, fs, (size_t)(0.4 * fs), (size_t)(0.4 * fs));  // 爆炸前
+        double a2 = goertzelAmp(monoOut, 1000.0, fs, (size_t)(1.3 * fs), (size_t)(0.4 * fs));  // 爆炸中
+        double a3 = goertzelAmp(monoOut, 1000.0, fs, (size_t)(2.2 * fs), (size_t)(0.4 * fs));  // 爆炸后
+        double d2 = 20 * log10(a2 / a1), d3 = 20 * log10(a3 / a1);
+        printf("[T6] 1kHz(脚步带) 爆炸中 %+.1f dB / 爆炸后 %+.1f dB (want |d| < 1.5) %s\n",
+               d2, d3, (fabs(d2) < 1.5 && fabs(d3) < 1.5) ? "PASS" : "FAIL");
+        printf("      total peak %.4f (ceil %.4f) %s\n", mx, dbToLin(-6.f),
+               mx <= dbToLin(-6.f) + 1e-3f ? "PASS" : "FAIL");
+    }
+
+    // ---- 5. realtime cost
+    {        DspCore d; d.Prepare((float)fs);
         DspParams p; d.SetParams(p);
         int blocks = 2000, frames = 480;
         std::vector<float> buf(frames * 2);

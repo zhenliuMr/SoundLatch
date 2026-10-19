@@ -179,6 +179,30 @@ private:
 };
 
 // --------------------------------------------------------------- core
+// 把"最大输出"分摊到 4 个频段：只压超出上限的通道——从最响的通道开始压到刚好够，
+// 其余通道保持 1.0（原样通过，比如没超标的脚步声）。这样总输出 ≤ 上限，
+// 但不是把整条信号等比压低。
+inline void AllocCeil(const float* P, float ceil, float* G) {
+    float sum = 0.f;
+    for (int b = 0; b < 4; ++b) { G[b] = 1.f; sum += P[b]; }
+    if (sum <= ceil || sum <= 1e-9f) return;
+    for (int iter = 0; iter < 8 && sum > ceil; ++iter) {
+        int idx = 0;
+        float best = -1.f;
+        for (int b = 0; b < 4; ++b) {
+            float v = P[b] * G[b];
+            if (v > best) { best = v; idx = b; }
+        }
+        if (best <= 1e-9f) break;
+        float others = sum - best;
+        float allow  = ceil - others;
+        float g      = (allow <= 0.f || P[idx] <= 1e-9f) ? 0.f : allow / P[idx];
+        if (g >= G[idx]) break;
+        sum  = others + P[idx] * g;
+        G[idx] = g;
+    }
+}
+
 class DspCore {
 public:
     static constexpr int kCB = 32;   // control block
@@ -208,6 +232,12 @@ public:
             ap600_[ch].reset(); ap3k_[ch].reset(); ap3kb_[ch].reset();
         }
         for (int b = 0; b < 4; ++b) { envB_[b].reset(); gPrev_[b] = gCur_[b] = 1.f; }
+        for (int b = 0; b < 4; ++b) {
+            limCur_[b] = limPrev_[b] = 1.f;
+            std::fill(pendL_[b], pendL_[b] + kCB, 0.f);
+            std::fill(pendR_[b], pendR_[b] + kCB, 0.f);
+        }
+        relLimCoef_ = 1.0f - expf(-1.0f / (fs_ * 0.080f));   // 限幅增益 80 ms 恢复
         envFast_.reset(); envSlow_.reset();
         limiter_.reset();
         trSm_ = 0.f;
@@ -230,8 +260,25 @@ public:
         return v;
     }
 
+    // 输入（系统输出）电平，供电平表显示真实音量（不受限幅削顶影响）
+    float MeterInPeak() {
+        float v = meterInPeak_.load(std::memory_order_relaxed);
+        meterInPeak_.store(0.f, std::memory_order_relaxed);
+        return v;
+    }
+
     void Process(float* io, int frames) {
         const DspParams p = params_;
+        {   // 记录输入峰值（处理前 = 系统输出电平）
+            float inp = 0.f;
+            for (int i = 0; i < frames; ++i) {
+                float a = fabsf(io[2 * i]), b = fabsf(io[2 * i + 1]);
+                float pk = a > b ? a : b;
+                if (pk > inp) inp = pk;
+            }
+            float cur = meterInPeak_.load(std::memory_order_relaxed);
+            if (inp > cur) meterInPeak_.store(inp, std::memory_order_relaxed);
+        }
         if (p.bypass) {
             if (p.bOn) limiter_.process(io, frames);
             track(io, frames);
@@ -244,6 +291,7 @@ public:
         const float sensDb  = 6.0f - 6.0f * p.stepSens;
         const float cutBase = -18.0f * p.envAmt;
         const float cutMax  = -12.0f * p.envAmt;
+        const float ceilLin = dbToLin(p.ceilDb);      // 线性上限（-120 dB 即静音）
 
         int base = 0;
         while (base < frames) {
@@ -298,23 +346,59 @@ public:
                 gCur_[b] = dbToLin(gdb);
             }
 
-            // ---- apply with per-sample ramp
+            // ---- 分频段限幅：只压超过上限的那条通道，其它通道原样通过 ----
+            // 先把 A/B 增益应用到本块，这样下面量到的峰值就是真正会输出的幅度
             float inv = 1.0f / (float)n;
             for (int i = 0; i < n; ++i) {
-                float oL = 0.f, oR = 0.f;
                 float t = (float)(i + 1) * inv;
                 for (int b = 0; b < 4; ++b) {
                     float g = gPrev_[b] + (gCur_[b] - gPrev_[b]) * t;
-                    oL += bl[b][i] * g;
-                    oR += br[b][i] * g;
+                    bl[b][i] *= g;
+                    br[b][i] *= g;
+                }
+            }
+
+            float P[4];
+            for (int b = 0; b < 4; ++b) {
+                float pk = 0.f;
+                for (int i = 0; i < n; ++i) {
+                    float a = fabsf(bl[b][i]), c = fabsf(br[b][i]);
+                    if (a > pk) pk = a;
+                    if (c > pk) pk = c;
+                }
+                P[b] = pk;
+            }
+
+            for (int b = 0; b < 4; ++b) limPrev_[b] = limCur_[b];
+            if (p.bOn) {
+                float G[4];
+                AllocCeil(P, ceilLin, G);            // 从最响的通道开始压，其余不动
+                for (int b = 0; b < 4; ++b)
+                    limCur_[b] = (G[b] < limCur_[b]) ? G[b]
+                                                     : limCur_[b] + (G[b] - limCur_[b]) * relLimCoef_;
+            } else {
+                for (int b = 0; b < 4; ++b) limCur_[b] = 1.f;
+            }
+
+            // ---- 输出上一块：用本块算出的增益，相当于 1 个控制块（≈0.67 ms）的前视 ----
+            for (int i = 0; i < n; ++i) {
+                float t = (float)(i + 1) * inv;
+                float oL = 0.f, oR = 0.f;
+                for (int b = 0; b < 4; ++b) {
+                    float g = limPrev_[b] + (limCur_[b] - limPrev_[b]) * t;
+                    oL += pendL_[b][i] * g;
+                    oR += pendR_[b][i] * g;
                 }
                 io[2 * (base + i)]     = oL;
                 io[2 * (base + i) + 1] = oR;
             }
+            for (int b = 0; b < 4; ++b) {
+                memcpy(pendL_[b], bl[b], sizeof(float) * (size_t)n);
+                memcpy(pendR_[b], br[b], sizeof(float) * (size_t)n);
+            }
             base += n;
         }
 
-        if (p.bOn) limiter_.process(io, frames);
         track(io, frames);
     }
 
@@ -336,6 +420,9 @@ private:
     float fs_ = 48000.f;
     float trSm_ = 0.f;
     float gPrev_[4] = {1, 1, 1, 1}, gCur_[4] = {1, 1, 1, 1};
+    float limCur_[4] = {1, 1, 1, 1}, limPrev_[4] = {1, 1, 1, 1};   // 分频段限幅增益
+    float pendL_[4][kCB]{}, pendR_[4][kCB]{};                     // 1 个控制块的前视缓存
+    float relLimCoef_ = 0.0002f;
     float peakOut_ = 0.f, rmsAcc_ = 0.f;
     int   rmsN_ = 0;
 
@@ -346,6 +433,7 @@ private:
     Limiter limiter_;
     DspParams params_{};
     std::atomic<float> meterPeak_{0.f};
+    std::atomic<float> meterInPeak_{0.f};
 };
 
 } // namespace sl
