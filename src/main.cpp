@@ -341,8 +341,10 @@ static int SliderPos(int i) { return (int)SendMessageW(SliderCtl(i), TBM_GETPOS,
 static void SliderSet(int i, int v) { SendMessageW(SliderCtl(i), TBM_SETPOS, TRUE, v); }
 
 // ---- 电平表 / 限幅阈值共用的一条 dB 标尺 ----
-// 柱形与游标都用它换算：左端 -60 dBFS，右端 0 dBFS（数字满刻度，不再留余量）。
-static constexpr float kMeterMinDb = -60.0f;
+// 柱形与游标都用它换算：左端 -18 dBFS，右端 0 dBFS（数字满刻度）。
+// 左端取 -18 而不是更低，是为了和「最大输出」滑杆的域完全一致：
+// 滑杆 1% = 柱形最左 = -18 dBFS，100% = 柱形最右 = 0 dBFS，拖到哪游标就落在哪。
+static constexpr float kMeterMinDb = -18.0f;
 static constexpr float kMeterMaxDb =   0.0f;
 
 // ---- 限幅阈值（最大输出）滑杆的取值域 ----
@@ -1060,7 +1062,8 @@ static void ShowPopup(bool activate = true) {
 
 // ----------------------------------------------------------------- meter
 // 标尺：kMeterMinDb .. kMeterMaxDb 线性映射到 0..1（常量在文件上方与限幅阈值共用）。
-// 右端就是 0 dBFS（满刻度），不留余量。
+// 左端 -18 dBFS、右端 0 dBFS，和「最大输出」滑杆同域：滑杆 1% 就在柱形最左。
+// 低于 -18 dBFS 的信号画 1px 短条，表示"有声音但在标尺外"。
 static constexpr float kMeterRelease = 0.55f;   // 回落速度（标尺比例/秒，约 36 dB/s）
 
 static inline float Clamp01f(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
@@ -1149,9 +1152,9 @@ static LRESULT CALLBACK MeterProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             // 直角槽：按需求不做圆角，填充、柱形、边框全是方角
             FillR(dc, tr, trackBg);
 
-            // 参考刻度：-48 / -36 / -24 / -12 dBFS（0 dBFS 就是右边界）
+            // 参考刻度：-16 / -12 / -8 / -4 dBFS（0 dBFS 就是右边界）
             {
-                const float tks[4] = { -48.f, -36.f, -24.f, -12.f };
+                const float tks[4] = { -16.f, -12.f, -8.f, -4.f };
                 for (int i = 0; i < 4; ++i) {
                     int x = tr.left + (int)(MeterNormDb(tks[i]) * W + 0.5f);
                     if (x >= tr.right - 1) x = tr.right - 1;
@@ -1170,6 +1173,9 @@ static LRESULT CALLBACK MeterProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             const float over    = raw > thrN ? raw : body;
             int xBody  = (int)(body * W + 0.5f);
             int xOver  = (int)(over * W + 0.5f);
+            // 低于标尺左端（<-18 dBFS）也给 1px：看得出"有信号，只是在范围外"
+            if (xBody < 1 && body > 0.001f) xBody = 1;
+            if (xOver < 1 && over > 0.001f) xOver = 1;
             if (xBody > W) xBody = W;
             if (xOver > W) xOver = W;
 
