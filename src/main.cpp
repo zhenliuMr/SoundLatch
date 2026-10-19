@@ -245,13 +245,22 @@ static void SyncDarkMode(HWND h) {
           (g_pfnPreferredAppMode && g_pfnAllowDarkForWindow) ? 1 : 0, (void*)h);
 }
 
+// 提示气泡跟随主题：走和面板同一套暗色 API，再覆盖底色/字色
+static void ThemeTooltip() {
+    if (!g_tip || !IsWindow(g_tip)) return;
+    InitUxThemeApi();
+    bool dark = !AppsIsLight();
+    SetAppDarkMode(dark);
+    ApplyDarkMode(g_tip);
+    if (g_pfnAllowDarkForWindow) g_pfnAllowDarkForWindow(g_tip, dark);
+    SendMessageW(g_tip, TTM_SETTIPBKCOLOR, (WPARAM)g_th.bg, 0);
+    SendMessageW(g_tip, TTM_SETTIPTEXTCOLOR, (WPARAM)g_th.text, 0);
+}
+
 static void RefreshTheme(HWND h) {
     MakeTheme();
     SyncDarkMode(h);
-    if (g_tip) {                     // 提示气泡也要跟着主题换底色/字色
-        SendMessageW(g_tip, TTM_SETTIPBKCOLOR, (WPARAM)g_th.bg, 0);
-        SendMessageW(g_tip, TTM_SETTIPTEXTCOLOR, (WPARAM)g_th.text, 0);
-    }
+    ThemeTooltip();                  // 提示气泡也要跟着主题换
     if (IsWindow(h)) {
         // 类背景刷也要跟着主题换，否则系统垫底永远是浅色
         SetClassLongPtrW(h, GCLP_HBRBACKGROUND, (LONG_PTR)g_brBg);
@@ -871,9 +880,10 @@ static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                                 0, 0, 0, 0, h, nullptr, g_hinst, nullptr);
         if (g_tip) {
             SendMessageW(g_tip, TTM_SETMAXTIPWIDTH, 0, S(320));
-            SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_AUTOMATIC, 300);
-            SendMessageW(g_tip, TTM_SETTIPBKCOLOR, (WPARAM)g_th.bg, 0);
-            SendMessageW(g_tip, TTM_SETTIPTEXTCOLOR, (WPARAM)g_th.text, 0);
+            SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_INITIAL, 200);    // 悬停 0.2 s 弹出
+            SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 600000); // 停留期间不自动关
+            SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_RESHOW, 100);
+            ThemeTooltip();
         }
         g_hQ1 = mkQ(L"\u9648\u4f4e\u73af\u5883\u97f3 + \u5f3a\u5316\u811a\u6b65\u58f0\n"
                     L"\n"
