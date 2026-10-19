@@ -139,6 +139,10 @@ private:
     size_t inLen_ = 0;
     double cur_ = 0.0;
     double ratio_ = 1.0;
+    // 欠载淡出/淡入斜坡的位置。必须是成员而非回调内局部量：WASAPI 回调周期
+    // 可能只有 2~3 ms（128~192 样本），短于 5 ms 斜坡长度；
+    // 每回调重置会让淡出永远爬不完，恢复瞬间产生硬跳变（实测 0.79阶跃）。
+    float duck_ = 1.0f;
     double integ_ = 0.0;
     double target_ = 0.0;
 };

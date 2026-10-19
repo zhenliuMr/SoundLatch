@@ -396,23 +396,44 @@ void AudioEngine::RenderLoop() {
             ratio_ += (wantRatio - ratio_) * 0.10;
             ratio_ = clampd(ratio_, 0.85, 1.15);
 
-            bool starve = false;
+            // 欠载时的淡出斜坡（5 ms）。不能用"重复末样本"：inBuf_ 是staging 缓冲，
+            // inLen_ 之后是几十毫秒前的旧数据，重复它等于把陈旧音频拉成直流，
+            // 恢复瞬间的相位跳变就是听感里的"咔哒"。也不能硬补零：0.5→0 的阶跃
+            // 同样是爆音。正确做法是先把输出平滑拉到 0，恢复时再平滑升回。
+            //
+            // duck_ 必须是**成员变量**而不是回调内局部量：WASAPI 共享模式的回调
+            // 周期可能只有 2~3 ms（128~192 样本），短于 5 ms 淡出斜坡长度。
+            // 若每回调重置为 1.0，淡出永远爬不完，恢复瞬间会出现硬跳变
+            // （实测 0.79 = -2 dBFS 的阶跃）。
+            const float kFadeStep = 1.0f / (5.0f * 0.001f * 48000.0f);   // 每样本 1/240
+            float duck = duck_;
+            bool starved = false;
             for (UINT32 k = 0; k < frames; ++k) {
                 size_t i0 = (size_t)cur_;
                 double fr = cur_ - (double)i0;
                 if (i0 + 1 >= inLen_) {
-                    f[k * 2]     = inLen_ ? inBuf_[(inLen_ - 1) * 2] : 0.f;
-                    f[k * 2 + 1] = inLen_ ? inBuf_[(inLen_ - 1) * 2 + 1] : 0.f;
-                    starve = true;
-                    continue;
+                    duck -= kFadeStep;
+                    if (duck < 0.f) duck = 0.f;
+                    starved = true;
+                } else if (duck < 1.0f) {
+                    duck += kFadeStep;                  // 数据恢复后淡入
+                    if (duck > 1.0f) duck = 1.0f;
                 }
-                float aL = inBuf_[i0 * 2], aR = inBuf_[i0 * 2 + 1];
-                float bL = inBuf_[(i0 + 1) * 2], bR = inBuf_[(i0 + 1) * 2 + 1];
-                f[k * 2]     = (float)(aL + (bL - aL) * fr);
-                f[k * 2 + 1] = (float)(aR + (bR - aR) * fr);
+                float sL, sR;
+                if (i0 + 1 >= inLen_) {
+                    sL = sR = 0.f;                     // 已淡到 0，不再重复旧样本
+                } else {
+                    float aL = inBuf_[i0 * 2], aR = inBuf_[i0 * 2 + 1];
+                    float bL = inBuf_[(i0 + 1) * 2], bR = inBuf_[(i0 + 1) * 2 + 1];
+                    sL = (float)(aL + (bL - aL) * fr);
+                    sR = (float)(aR + (bR - aR) * fr);
+                }
+                f[k * 2]     = sL * duck;
+                f[k * 2 + 1] = sR * duck;
                 cur_ += ratio_;
             }
-            if (starve) {
+            duck_ = duck;
+            if (starved) {
                 underruns_.fetch_add(1);
                 ratio_ = clampd(ratio_ * 0.997, 0.85, 1.15);   // emergency: pull back, avoid repeat
             }
@@ -424,7 +445,9 @@ void AudioEngine::RenderLoop() {
             ringMs_.store(ringMs);
             dbgLevel_.store((float)((double)inLen_ - cur_));
             dbgRatio_.store((float)ratio_);
-            float look = dsp_->Params().bOn ? dsp_->Params().lookMs : 0.f;
+            // 单次快照：连续调两次 Params() 可能落在不同的双缓冲槽上
+            const DspParams snap = dsp_->ParamsSnapshot();
+            float look = snap.bOn ? snap.lookMs : 0.f;
             latencyMs_.store(capBufMs_ + ringMs + renBufMs_ + look);
         }
     } while (false);
