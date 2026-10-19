@@ -15,7 +15,7 @@
 [![latency](https://img.shields.io/badge/算法延迟-0.67%20ms-3B6D11?style=flat-square)](https://github.com/zhenliuMr/SoundLatch)
 [![tests](https://img.shields.io/badge/离线验收-12%20项%20PASS-639922?style=flat-square)](https://github.com/zhenliuMr/SoundLatch)
 
-[![download](https://img.shields.io/badge/下载-SoundLatch.exe-0078D4?style=for-the-badge&logo=windows)](https://github.com/zhenliuMr/SoundLatch/releases/tag/v1.2.0)
+[![download](https://img.shields.io/badge/下载-SoundLatch--1.2.0--x64.exe-0078D4?style=for-the-badge&logo=windows)](https://github.com/zhenliuMr/SoundLatch/releases/download/v1.2.0/SoundLatch-1.2.0-x64.exe)
 [![vbcable](https://img.shields.io/badge/依赖-VB--Cable-BA7517?style=for-the-badge&logo=virtualbox)](https://vb-audio.com/Cable/)
 
 </div>
@@ -24,7 +24,7 @@
 
 Windows 实时音频处理，两个开关：**降低环境音 + 强化脚步声**、**锁定最大输出**。
 
-- 单文件 `SoundLatch.exe`（412 KiB），无安装、无运行库依赖
+- 单文件 `SoundLatch-1.2.0-x64.exe`（412 KiB），无安装、无运行库依赖
 - 启动后**静默进托盘**（右下角），不弹任何窗口；点托盘图标才展开面板——所有开关、滑杆、设备选择都在这一页，没有第二个窗口
 - 开机自启动勾选后也是静默启动，直接开始处理音频
 - 界面跟随系统浅色/深色主题，托盘图标自适应明暗
