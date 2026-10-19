@@ -178,31 +178,6 @@ private:
     std::vector<int>   pidx_;
 };
 
-// --------------------------------------------------------------- core
-// 把"最大输出"分摊到 4 个频段：只压超出上限的通道——从最响的通道开始压到刚好够，
-// 其余通道保持 1.0（原样通过，比如没超标的脚步声）。这样总输出 ≤ 上限，
-// 但不是把整条信号等比压低。
-inline void AllocCeil(const float* P, float ceil, float* G) {
-    float sum = 0.f;
-    for (int b = 0; b < 4; ++b) { G[b] = 1.f; sum += P[b]; }
-    if (sum <= ceil || sum <= 1e-9f) return;
-    for (int iter = 0; iter < 8 && sum > ceil; ++iter) {
-        int idx = 0;
-        float best = -1.f;
-        for (int b = 0; b < 4; ++b) {
-            float v = P[b] * G[b];
-            if (v > best) { best = v; idx = b; }
-        }
-        if (best <= 1e-9f) break;
-        float others = sum - best;
-        float allow  = ceil - others;
-        float g      = (allow <= 0.f || P[idx] <= 1e-9f) ? 0.f : allow / P[idx];
-        if (g >= G[idx]) break;
-        sum  = others + P[idx] * g;
-        G[idx] = g;
-    }
-}
-
 class DspCore {
 public:
     static constexpr int kCB = 32;   // control block
@@ -237,7 +212,9 @@ public:
             std::fill(pendL_[b], pendL_[b] + kCB, 0.f);
             std::fill(pendR_[b], pendR_[b] + kCB, 0.f);
         }
-        relLimCoef_ = 1.0f - expf(-1.0f / (fs_ * 0.080f));   // 限幅增益 80 ms 恢复
+        // 注意：这个系数是"每个控制块"用一次（kCB=32 样本），所以要按块长折算，
+        // 否则实际恢复时间会慢 32 倍（80 ms 变成 2.56 s，枪声后整条信号会被压低好几秒）
+        relLimCoef_ = 1.0f - expf(-(float)kCB / (fs_ * 0.080f));
         envFast_.reset(); envSlow_.reset();
         limiter_.reset();
         trSm_ = 0.f;
@@ -346,7 +323,7 @@ public:
                 gCur_[b] = dbToLin(gdb);
             }
 
-            // ---- 分频段限幅：只压超过上限的那条通道，其它通道原样通过 ----
+            // ---- 限幅：超出的部分压到用户设的上限，整条信号一个增益（不分频段） ----
             // 先把 A/B 增益应用到本块，这样下面量到的峰值就是真正会输出的幅度
             float inv = 1.0f / (float)n;
             for (int i = 0; i < n; ++i) {
@@ -358,24 +335,21 @@ public:
                 }
             }
 
-            float P[4];
-            for (int b = 0; b < 4; ++b) {
-                float pk = 0.f;
-                for (int i = 0; i < n; ++i) {
-                    float a = fabsf(bl[b][i]), c = fabsf(br[b][i]);
-                    if (a > pk) pk = a;
-                    if (c > pk) pk = c;
-                }
-                P[b] = pk;
+            // 4 段叠加后的真实输出峰值
+            float pk = 0.f;
+            for (int i = 0; i < n; ++i) {
+                float a = fabsf(bl[0][i] + bl[1][i] + bl[2][i] + bl[3][i]);
+                float c = fabsf(br[0][i] + br[1][i] + br[2][i] + br[3][i]);
+                if (a > pk) pk = a;
+                if (c > pk) pk = c;
             }
 
             for (int b = 0; b < 4; ++b) limPrev_[b] = limCur_[b];
             if (p.bOn) {
-                float G[4];
-                AllocCeil(P, ceilLin, G);            // 从最响的通道开始压，其余不动
+                float target = (pk > ceilLin) ? ceilLin / pk : 1.0f;   // 压到上限即可
                 for (int b = 0; b < 4; ++b)
-                    limCur_[b] = (G[b] < limCur_[b]) ? G[b]
-                                                     : limCur_[b] + (G[b] - limCur_[b]) * relLimCoef_;
+                    limCur_[b] = (target < limCur_[b]) ? target
+                                                       : limCur_[b] + (target - limCur_[b]) * relLimCoef_;
             } else {
                 for (int b = 0; b < 4; ++b) limCur_[b] = 1.f;
             }
