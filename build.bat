@@ -3,7 +3,12 @@ setlocal
 set PATH=D:\toolchain\mingw64\bin;%PATH%
 if not exist dist mkdir dist
 echo [1/2] compiling resources...
-windres -I res -i res\app.rc -O coff -o res\app.res
+rem NOTE: keep this file ASCII-only. cmd.exe reads .bat as the system ANSI
+rem codepage (ACP=936 / GBK here); non-ASCII bytes in comments break parsing.
+rem -c 65001 forces windres to read res\app.rc as UTF-8. Without it windres
+rem uses the system ANSI codepage (GBK), so the Chinese in FileDescription
+rem ends up mojibake in the exe's file properties.
+windres -I res -i res\app.rc -O coff -c 65001 -o res\app.res
 if errorlevel 1 (
   echo RESOURCE FAILED
   exit /b 1

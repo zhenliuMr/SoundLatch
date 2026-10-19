@@ -1,4 +1,4 @@
-#include <windows.h>
+﻿#include <windows.h>
 
 // 版本号与 README / GitHub Release 保持同步
 #define SL_VER_MAJOR 1
