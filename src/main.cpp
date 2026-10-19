@@ -50,12 +50,7 @@ static ULONGLONG g_autoHideTick = 0;        // 因失焦自动收起的时刻
 static ULONGLONG g_showTick = 0;           // 最近一次显示面板的时刻
 static HWND g_hA, g_hB, g_hEnvAmt, g_hEnvThr, g_hStepAmt, g_hStepSens, g_hCeil;
 static HWND g_hCap, g_hRen, g_hLoop, g_hReset, g_hMeter, g_hAuto, g_hPin;
-static HWND g_hQ1, g_hQ2;         // 问号说明
-static HWND g_hTip;               // 自绘提示气泡
-static HWND g_tipOwner;           // 当前悬停的问号
-static const wchar_t* g_tipSrc;   // 对应文案
-static std::wstring g_tipDraw;    // 绘制用的文案
-static const UINT_PTR kTipTimer = 2;
+static HWND g_hQ1, g_hQ2, g_tip;   // 问号说明 + 悬浮提示
 static bool g_pinned = false;   // 固定到屏幕：失焦也不收起
 static HWND g_hLblEnvAmt, g_hLblEnvThr, g_hLblStepAmt, g_hLblStepSens, g_hLblCeil;
 
@@ -68,7 +63,6 @@ static bool g_quit = false;
 
 static void slLog(const wchar_t* fmt, ...);
 static void HidePopup();
-static void HideTip();
 // 电平表（0..1 = 标尺比例，见 kMeterMinDb/kMeterMaxDb）
 static float g_meterLevel = 0.f;    // 平滑后的输入电平
 
@@ -251,9 +245,22 @@ static void SyncDarkMode(HWND h) {
           (g_pfnPreferredAppMode && g_pfnAllowDarkForWindow) ? 1 : 0, (void*)h);
 }
 
+// 提示气泡跟随主题：走和面板同一套暗色 API，再覆盖底色/字色
+static void ThemeTooltip() {
+    if (!g_tip || !IsWindow(g_tip)) return;
+    InitUxThemeApi();
+    bool dark = !AppsIsLight();
+    SetAppDarkMode(dark);
+    ApplyDarkMode(g_tip);
+    if (g_pfnAllowDarkForWindow) g_pfnAllowDarkForWindow(g_tip, dark);
+    SendMessageW(g_tip, TTM_SETTIPBKCOLOR, (WPARAM)g_th.bg, 0);
+    SendMessageW(g_tip, TTM_SETTIPTEXTCOLOR, (WPARAM)g_th.text, 0);
+}
+
 static void RefreshTheme(HWND h) {
     MakeTheme();
     SyncDarkMode(h);
+    ThemeTooltip();                  // 提示气泡也要跟着主题换
     if (IsWindow(h)) {
         // 类背景刷也要跟着主题换，否则系统垫底永远是浅色
         SetClassLongPtrW(h, GCLP_HBRBACKGROUND, (LONG_PTR)g_brBg);
@@ -811,92 +818,6 @@ static LRESULT DrawSlider(HWND sl, NMCUSTOMDRAW* cd) {
     return CDRF_SKIPDEFAULT;
 }
 
-// ---------------- 自绘提示气泡 ----------------
-// 不用 comctl32 的 tooltip：它的“自动消失”时间被系统键制（TTDT_AUTOPOP 最多几秒），
-// 而且 Win10 1903+ 的颜色由可视样式决定，TTM_SETTIPBKCOLOR 会被忽略。
-// 自己画一个小窗口：停留期间不会自动关，颜色完全跟随当前主题。
-static WNDPROC g_qOld = nullptr;
-
-static void HideTip() {
-    if (g_hTip && IsWindow(g_hTip)) DestroyWindow(g_hTip);
-    g_hTip = nullptr;
-    g_tipOwner = nullptr;
-}
-
-static void ShowTipFor(HWND owner, const wchar_t* text) {
-    HideTip();
-    if (!owner || !text || !*text) return;
-    g_tipDraw = text;
-
-    RECT orc; GetWindowRect(owner, &orc);
-    RECT wa;  SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-
-    HDC dc = GetDC(owner);
-    HFONT old = (HFONT)SelectObject(dc, g_fLabel);
-    RECT rc{ 0, 0, S(320), 0 };
-    DrawTextW(dc, g_tipDraw.c_str(), -1, &rc, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
-    SelectObject(dc, old);
-    ReleaseDC(owner, dc);
-
-    int w = (rc.right - rc.left) + S(16);
-    int hgt = (rc.bottom - rc.top) + S(14);
-    int x = orc.left - w - S(6);                    // 默认在问号左侧
-    if (x < wa.left + S(8)) x = orc.right + S(6);
-    if (x + w > wa.right - S(8)) x = wa.right - w - S(8);
-    int y = orc.top - hgt - S(4);                   // 默认在问号上方
-    if (y < wa.top + S(8)) y = orc.bottom + S(4);
-    if (y + hgt > wa.bottom - S(8)) y = wa.bottom - hgt - S(8);
-
-    g_hTip = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"SLTipWnd", L"",
-                             WS_POPUP, x, y, w, hgt, owner, nullptr, g_hinst, nullptr);
-    if (!g_hTip) return;
-    ShowWindow(g_hTip, SW_SHOWNOACTIVATE);
-    InvalidateRect(g_hTip, nullptr, TRUE);
-}
-
-static LRESULT CALLBACK TipProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    switch (m) {
-    case WM_PAINT: {
-        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
-        RECT rc; GetClientRect(h, &rc);
-        FillR(dc, rc, g_th.field);                  // 气泡底色（暗色下略亮，和面板区分）
-        HBRUSH bd = CreateSolidBrush(g_th.border);
-        FrameRect(dc, &rc, bd);
-        DeleteObject(bd);
-        RECT tr = rc;
-        tr.left += S(8); tr.top += S(7); tr.right -= S(8); tr.bottom -= S(7);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, g_th.text);
-        HGDIOBJ of = SelectObject(dc, g_fLabel);
-        DrawTextW(dc, g_tipDraw.c_str(), -1, &tr, DT_WORDBREAK | DT_NOPREFIX);
-        SelectObject(dc, of);
-        EndPaint(h, &ps);
-        return 0;
-    }
-    case WM_ACTIVATE:                               // 被点到就关掉
-        HideTip();
-        return 0;
-    case WM_ERASEBKGND:
-        return 1;
-    }
-    return DefWindowProcW(h, m, w, l);
-}
-
-// 问号控件的子类化：只跟踪鼠标进出，提示的生命周期完全自己控制
-static LRESULT CALLBACK QProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == WM_MOUSEMOVE) {
-        TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, h, 0 };
-        TrackMouseEvent(&tme);
-        g_tipOwner = h;
-        g_tipSrc = (const wchar_t*)GetWindowLongPtrW(h, GWLP_USERDATA);
-        SetTimer(GetParent(h), kTipTimer, 200, nullptr);   // 悬停 0.2 s 再弹，防扯过时闪
-    } else if (m == WM_MOUSELEAVE) {
-        KillTimer(GetParent(h), kTipTimer);
-        HideTip();                                          // 移出问号立即关闭
-    }
-    return CallWindowProcW(g_qOld, h, m, w, l);
-}
-
 static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CREATE: {
@@ -938,16 +859,45 @@ static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetFont(g_hB, g_fBtn);
         SendMessageW(g_hB, BM_SETCHECK, BST_CHECKED, 0);
 
-        // 问号说明：鼠标悬停显示下面几条滑杆对 PUBG 声音的影响
+        // 问号说明：鼠标悬浮显示下面几条滑杆对 PUBG 声音的影响
         auto mkQ = [&](const wchar_t* tip) {
             HWND q = CreateWindowExW(0, L"STATIC", L"?",
                                      WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_CENTER | SS_CENTERIMAGE,
                                      0, 0, S(20), S(20), h, nullptr, g_hinst, nullptr);
             SetFont(q, g_fLabel);
-            SetWindowLongPtrW(q, GWLP_USERDATA, (LONG_PTR)tip);   // 子类化里取文案
-            g_qOld = (WNDPROC)SetWindowLongPtrW(q, GWLP_WNDPROC, (LONG_PTR)QProc);
+            if (g_tip) {
+                TOOLINFOW ti{};
+                ti.cbSize = sizeof(ti);
+                ti.uFlags = TTF_SUBCLASS | TTF_IDISHWND;   // uId 直接放窗口句柄，否则提示会挂到父窗口上
+                ti.hwnd   = h;
+                ti.uId    = (UINT_PTR)q;
+                ti.lpszText = (LPWSTR)tip;
+                SendMessageW(g_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+            }
             return q;
         };
+        g_tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP,
+                                0, 0, 0, 0, h, nullptr, g_hinst, nullptr);
+        if (g_tip) {
+            SendMessageW(g_tip, TTM_SETMAXTIPWIDTH, 0, S(320));
+            SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_INITIAL, 200);    // 悬停 0.2 s 弹出
+            SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 600000); // 停留期间不自动关
+            SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_RESHOW, 100);
+            ThemeTooltip();
+        }
+        g_hQ1 = mkQ(L"\u9648\u4f4e\u73af\u5883\u97f3 + \u5f3a\u5316\u811a\u6b65\u58f0\n"
+                    L"\n"
+                    L"\u73af\u5883\u6291\u5236\uff1a\u538b\u4f4e 20-150 Hz\uff08\u7206\u70b8\u8f6f\u9e23\u3001\u8f7d\u5177\u5f15\u64ce\u3001\u8fdc\u5904\u70ae\u58f0\uff09\u3002\u8c03\u9ad8\u66f4\u5e72\u51c0\uff0c\u4f46\u7206\u70b8\u51b2\u51fb\u611f\u53d8\u5f31\u3002\n"
+                    L"\u73af\u5883\u9608\u503c\uff1a\u4f4e\u4e8e\u8fd9\u4e2a\u7535\u5e73\u7684\u4f4e\u9891\u624d\u7b97\u73af\u5883\uff0c\u4f1a\u88ab\u989d\u5916\u538b\u4f4e\uff1b\u9ad8\u4e8e\u5b83\u89c6\u4e3a\u5b9e\u97f3\u4fdd\u7559\u3002\n"
+                    L"\u811a\u6b65\u589e\u5f3a\uff1a\u62ac\u9ad8 150 Hz \u4ee5\u4e0a\uff0c\u5176\u4e2d 0.6-3k\uff08\u811a\u6b65\u4e3b\u4f53\uff09\u62ac\u5f97\u6700\u591a\uff0c3-16k \u62ac\u4e00\u534a\u3002\n"
+                    L"\u77ac\u6001\u7075\u654f\u5ea6\uff1a\u591a\u5c0f\u7684\u54cd\u52a8\u624d\u89e6\u53d1\u589e\u5f3a\u3002\u9ad8=\u8f7b\u811a\u6b65\u4e5f\u6293\u5f97\u5230\uff0c\u4f4e=\u53ea\u6709\u5f00\u67aa\u7206\u70b8\u624d\u89e6\u53d1\u3002");
+        g_hQ2 = mkQ(L"\u9501\u5b9a\u6700\u5927\u8f93\u51fa\u97f3\u91cf\n"
+                    L"\n"
+                    L"\u6700\u5927\u8f93\u51fa\uff1a\u8f93\u51fa\u5cf0\u503c\u7684\u5929\u82b1\u677f\u3002\u8d85\u8fc7\u7684\u90e8\u5206\u77ac\u95f4\u538b\u5230\u8fd9\u6761\u7ebf\uff0c80 ms \u540e\u6062\u590d\u3002\n"
+                    L"100% = 0 dBFS \u4e0d\u9650\u5236\uff1b1% = -18 dBFS\uff1b0% = \u9759\u97f3\u3002\n"
+                    L"\u8d85\u8fc7\u5f97\u591a\u538b\u5f97\u8d8a\u591a\uff0c\u4f46\u97f3\u8272\u4e0d\u53d8\uff08\u6574\u6761\u4fe1\u53f7\u540c\u4e00\u4e2a\u589e\u76ca\uff09\u3002\n"
+                    L"\u4e5f\u53ef\u4ee5\u76f4\u63a5\u5728\u4e0b\u65b9\u7684\u7535\u5e73\u67f1\u4e0a\u6309\u4f4f\u5de6\u53f3\u62d6\u52a8\u6765\u8bbe\u7f6e\u3002");
+
         g_hLblCeil = mkLabel(L"");
         g_hCeil    = mkSlider(IDC_CEIL, 0, kCeilPosMax, 950);
         g_hMeter   = CreateWindowExW(0, L"SLMETER", L"", WS_CHILD | WS_VISIBLE,
@@ -1112,11 +1062,6 @@ static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (g_hMeter) InvalidateRect(g_hMeter, nullptr, FALSE);
             return 0;
         }
-        if (w == kTipTimer) {                       // 悬停到点，弹提示
-            KillTimer(h, kTipTimer);
-            if (g_tipOwner) ShowTipFor(g_tipOwner, g_tipSrc);
-            return 0;
-        }
         return 0;
     case WM_CLOSE:
         ShowWindow(h, SW_HIDE);
@@ -1133,7 +1078,6 @@ static void HidePopup() {
     reentering = true;
     g_popupShown = false;                // 先改状态，再隐藏
     ShowWindow(g_popup, SW_HIDE);
-    HideTip();
     SaveConfig();                        // 收起面板就落盘，避免被强制结束进程时丢参数
     reentering = false;
 }
@@ -1533,14 +1477,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     pc.hbrBackground = g_brBg;                 // 跟随主题的类背景刷
     pc.lpszClassName = L"SoundLatchPopup";
     RegisterClassExW(&pc);
-
-    WNDCLASSEXW tc{};
-    tc.cbSize = sizeof(tc);
-    tc.lpfnWndProc = TipProc;
-    tc.hInstance = hInst;
-    tc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    tc.lpszClassName = L"SLTipWnd";
-    RegisterClassExW(&tc);
 
     WNDCLASSEXW mc{};
     mc.cbSize = sizeof(mc);
