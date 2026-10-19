@@ -33,7 +33,7 @@ using namespace sl;
 // ----------------------------------------------------------------- ids
 enum {
     IDC_A = 101, IDC_B = 102,
-    IDC_ENVAMT = 110, IDC_ENVTHR = 111, IDC_STEPAMT = 112, IDC_STEPSENS = 113,
+    IDC_ENVAMT = 110, IDC_STEPAMT = 112,
     IDC_CEIL = 114,
     IDC_CAP = 120, IDC_REN = 121, IDC_LOOPBACK = 122, IDC_RESET = 124, IDC_AUTOSTART = 125, IDC_PIN = 126,
     IDC_METER = 130
@@ -48,11 +48,11 @@ static bool  g_anchorValid = false;
 static bool  g_popupShown = false;          // 面板是否处于展开状态（唯一状态源）
 static ULONGLONG g_autoHideTick = 0;        // 因失焦自动收起的时刻
 static ULONGLONG g_showTick = 0;           // 最近一次显示面板的时刻
-static HWND g_hA, g_hB, g_hEnvAmt, g_hEnvThr, g_hStepAmt, g_hStepSens, g_hCeil;
+static HWND g_hA, g_hB, g_hEnvAmt, g_hStepAmt, g_hCeil;
 static HWND g_hCap, g_hRen, g_hLoop, g_hReset, g_hMeter, g_hAuto, g_hPin;
-static HWND g_hQ1, g_hQ2, g_tip;   // 问号说明 + 悬浮提示
+static HWND g_hQ1, g_hQ2;   // 问号说明（气泡由 g_bubble 自绘）
 static bool g_pinned = false;   // 固定到屏幕：失焦也不收起
-static HWND g_hLblEnvAmt, g_hLblEnvThr, g_hLblStepAmt, g_hLblStepSens, g_hLblCeil;
+static HWND g_hLblEnvAmt, g_hLblStepAmt, g_hLblCeil;
 
 static DspCore g_dsp;
 static DspParams g_params;
@@ -245,22 +245,18 @@ static void SyncDarkMode(HWND h) {
           (g_pfnPreferredAppMode && g_pfnAllowDarkForWindow) ? 1 : 0, (void*)h);
 }
 
-// 提示气泡跟随主题：走和面板同一套暗色 API，再覆盖底色/字色
-static void ThemeTooltip() {
-    if (!g_tip || !IsWindow(g_tip)) return;
-    InitUxThemeApi();
-    bool dark = !AppsIsLight();
-    SetAppDarkMode(dark);
-    ApplyDarkMode(g_tip);
-    if (g_pfnAllowDarkForWindow) g_pfnAllowDarkForWindow(g_tip, dark);
-    SendMessageW(g_tip, TTM_SETTIPBKCOLOR, (WPARAM)g_th.bg, 0);
-    SendMessageW(g_tip, TTM_SETTIPTEXTCOLOR, (WPARAM)g_th.text, 0);
-}
+// 提示气泡自绘（实现在下方 FillRound/Txt 之后），这里只要前向声明
+static HWND g_bubble = nullptr;
+static void HideBubble();
+static void TipReset();
 
 static void RefreshTheme(HWND h) {
     MakeTheme();
     SyncDarkMode(h);
-    ThemeTooltip();                  // 提示气泡也要跟着主题换
+    if (g_bubble) {                 // 气泡颜色是自绘的，重画一次即可跟随新主题
+        InvalidateRect(g_bubble, nullptr, FALSE);
+        RedrawWindow(g_bubble, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+    }
     if (IsWindow(h)) {
         // 类背景刷也要跟着主题换，否则系统垫底永远是浅色
         SetClassLongPtrW(h, GCLP_HBRBACKGROUND, (LONG_PTR)g_brBg);
@@ -343,12 +339,134 @@ static void Txt(HDC dc, const wchar_t* s, RECT r, COLORREF c, HFONT f, UINT fmt)
     SelectObject(dc, old);
 }
 
+// ----------------------------------------------------------------- 自绘说明气泡
+// 不用系统 tooltip：它的暗色只能靠 TTM_SETTIPBKCOLOR 覆盖，25H2 上不生效；
+// 自动关闭时长也由 comctl32 内部计时器决定（TTDT_AUTOPOP 在 Win10+ 上经常被
+// 忽略），实测约 6 s 就消失。改成自己的顶层窗口：颜色永远跟 g_th 一致，
+// 显隐完全由 33 ms 心跳里的鼠标命中判定驱动，不存在超时。
+static HWND  g_tipAnchor = nullptr;   // 当前气泡挂在哪个问号上
+static ULONGLONG g_tipShowAt = 0;     // 悬停多久后弹出
+static const wchar_t* TipTextOf(HWND q) {
+    if (!q) return nullptr;
+    if (q == g_hQ1) return L"降低环境音 + 强化脚步声\n"
+                        L"\n"
+                        L"环境抑制：压低 20-150 Hz 的隆隆声（载具引擎、远处枪声、风的低频）。\n"
+                        L"判据是「低频比中高频明显独大」，所以不影响人声和脚步。\n"
+                        L"\n"
+                        L"脚步增强：脚步声集中在 0.6-3 kHz，抬得最多。\n"
+                        L"只在「中频出现比低频更快的突增」时触发，爆炸冲击不会误触发。";
+    if (q == g_hQ2) return L"锁定最大输出音量\n"
+                        L"\n"
+                        L"最大输出：输出峰值的天花板。超过的部分瞬间压到这条线，80 ms 后恢复。\n"
+                        L"100% = 0 dBFS 不限制；1% = -36 dBFS；0% = 静音。\n"
+                        L"超过得越多压得越多，但音色不变（整条信号同一个增益）。\n"
+                        L"也可以直接在下面的电平柱上按住左右拖动来设置。";
+    return nullptr;
+}
+
+static bool InWin(HWND h, POINT pt) {
+    if (!h || !IsWindow(h) || !IsWindowVisible(h)) return false;
+    RECT r;
+    GetWindowRect(h, &r);
+    return PtInRect(&r, pt) != 0;
+}
+
+static void HideBubble() {
+    if (g_bubble && IsWindowVisible(g_bubble)) ShowWindow(g_bubble, SW_HIDE);
+}
+
+// 气泡摆在问号右下，越界时翻到左侧/上方
+static void PlaceBubble(HWND anchor) {
+    if (!g_bubble || !anchor) return;
+    const int pad = S(10), gap = S(6);
+    const wchar_t* s = TipTextOf(anchor);
+    if (!s) return;
+
+    HDC dc = GetDC(g_bubble);
+    HGDIOBJ of = SelectObject(dc, g_pSmall);
+    RECT tr{ 0, 0, S(330), 0 };
+    DrawTextW(dc, s, -1, &tr, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    SelectObject(dc, of);
+    ReleaseDC(g_bubble, dc);
+    int w = tr.right - tr.left + pad * 2;
+    int h = tr.bottom - tr.top + pad * 2;
+
+    RECT ar;
+    GetWindowRect(anchor, &ar);
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    int x = ar.right + gap;
+    int y = ar.bottom + gap;
+    if (x + w > wa.right) x = ar.left - gap - w;
+    if (y + h > wa.bottom) y = ar.top - gap - h;
+    if (x < wa.left) x = wa.left;
+    if (y < wa.top) y = wa.top;
+    // 30 fps 心跳每帧都调，位置尺寸没变就别再 SetWindowPos（否则白刷一遍）
+    static int px = -1, py = -1, pw = -1, ph = -1;
+    if (x != px || y != py || w != pw || h != ph) {
+        px = x; py = y; pw = w; ph = h;
+        SetWindowPos(g_bubble, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    } else if (!IsWindowVisible(g_bubble)) {
+        SetWindowPos(g_bubble, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+}
+
+static LRESULT CALLBACK BubbleProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;              // 气泡不吃焦点，也不让面板失焦收起
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        FillRound(dc, rc, 6, g_th.light ? RGB(255, 255, 255) : RGB(45, 45, 48));
+        StrokeRound(dc, rc, 6, g_th.border);
+        RECT tr = rc;
+        InflateRect(&tr, -S(10), -S(8));
+        Txt(dc, TipTextOf(g_tipAnchor), tr, g_th.text, g_pSmall,
+            DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+// 面板心跳里驱动：命中问号 -> 延时弹出；鼠标离开问号和气泡 -> 立刻消失
+static void TipTick() {
+    if (!g_popup || !IsWindowVisible(g_popup)) { HideBubble(); g_tipAnchor = nullptr; return; }
+    POINT pt;
+    GetCursorPos(&pt);
+    HWND q = InWin(g_hQ1, pt) ? g_hQ1 : (InWin(g_hQ2, pt) ? g_hQ2 : nullptr);
+    if (q) {
+        if (q != g_tipAnchor) {
+            g_tipAnchor = q;
+            g_tipShowAt = GetTickCount64() + 200;      // 悬停 0.2 s 再弹，避免路过时闪一下
+        }
+    } else if (!InWin(g_bubble, pt)) {
+        g_tipAnchor = nullptr;                          // 鼠标移到气泡上时保持显示，可选中文字
+    }
+    if (!g_tipAnchor) { HideBubble(); return; }
+    if (!IsWindowVisible(g_bubble)) {
+        if (GetTickCount64() >= g_tipShowAt) PlaceBubble(g_tipAnchor);
+    } else {
+        PlaceBubble(g_tipAnchor);                      // 面板被拖动时气泡跟着走
+    }
+}
+
+static void TipReset() {
+    g_tipAnchor = nullptr;
+    HideBubble();
+}
+
+// 环境抑制 / 脚步增强：4 个滑杆中的第 0、1 个（阈值与灵敏度已实测固化，不再暴露）
 static HWND SliderCtl(int i) {
     switch (i) {
     case 0: return g_hEnvAmt;
-    case 1: return g_hEnvThr;
-    case 2: return g_hStepAmt;
-    case 3: return g_hStepSens;
+    case 1: return g_hStepAmt;
     default: return g_hCeil;
     }
 }
@@ -356,19 +474,22 @@ static int SliderPos(int i) { return (int)SendMessageW(SliderCtl(i), TBM_GETPOS,
 static void SliderSet(int i, int v) { SendMessageW(SliderCtl(i), TBM_SETPOS, TRUE, v); }
 
 // ---- 电平表 / 限幅阈值共用的一条 dB 标尺 ----
-// 柱形与游标都用它换算：左端 -18 dBFS，右端 0 dBFS（数字满刻度）。
-// 左端取 -18 而不是更低，是为了和「最大输出」滑杆的域完全一致：
-// 滑杆 1% = 柱形最左 = -18 dBFS，100% = 柱形最右 = 0 dBFS，拖到哪游标就落在哪。
-static constexpr float kMeterMinDb = -18.0f;
+// 柱形与游标都用它换算：左端 -36 dBFS，右端 0 dBFS（数字满刻度）。
+// 与「最大输出」滑杆共用同一条标尺：滑杆 1% = 柱形最左 = -36 dBFS，
+// 100% = 柱形最右 = 0 dBFS，拖到哪游标就落在哪。
+// 范围从 -18 扩到 -36：实测限幅器只削峰值不削 RMS，游戏素材峰均比12~24 dB，
+// 上限设在 -18 dBFS 时 RMS 只掉 0.07~0.28 dB —— 5% 和 100% 听起来几乎一样。
+static constexpr float kMeterMinDb = -36.0f;
 static constexpr float kMeterMaxDb =   0.0f;
 
 // ---- 限幅阈值（最大输出）滑杆的取值域 ----
 // 语义：这就是"当前允许的最大输出音量"——高于它的峰值被压到这条线，低于它的原样通过。
 //   位置 0       = 静音（真·0 输出）
-//   位置 1..1000 = -18 .. 0 dBFS（1% = -18 dBFS，100% = 0 dBFS 不限制）
-// 下限只到 -18 dBFS：再低就只剩"整体变小"，听感差异用系统扬声器音量调更直观。
+//   位置 1..1000 = -36 .. 0 dBFS（1% = -36 dBFS，100% = 0 dBFS 不限制）
+// 范围 -36..0：限幅器是峰值处理器，低端必须给够才能真正压住响的声音。
+// 原 -18..0 太窄，实测在典型游戏混音下 5% 与 100% 的 RMS 差异不足 0.3 dB。
 static constexpr float kCeilMuteDb = -120.0f;                   // 位置 0 用的静音值
-static constexpr float kCeilMinDb  = -18.0f;
+static constexpr float kCeilMinDb  = -36.0f;
 static constexpr int   kCeilPosMax = 1000;
 static inline float CeilPosToDb(int pos) {
     if (pos <= 0) return kCeilMuteDb;
@@ -384,14 +505,18 @@ static inline int CeilDbToPos(float db) {
 static void FormatValue(int i, wchar_t* b, int n) {
     int p = SliderPos(i);
     switch (i) {
-    case 0: swprintf(b, n, L"%d%%", p); break;
-    case 1: swprintf(b, n, L"%d dBFS", -60 + p); break;
-    case 2: swprintf(b, n, L"+%d dB", (p * 12 + 50) / 100); break;
-    case 3: swprintf(b, n, L"%d%%", p); break;
-    case 4:
+    case 0: swprintf(b, n, L"%d%%", p); break;                          // 环境抑制
+    case 1: {
+        // kStepBoostMax 是 float，直接算会变成浮点表达式再传给 %d（varargs 按 double 传），
+        // 读出来是垃圾值。必须显式转 int。
+        int db = (int)((p * sl::judge::kStepBoostMax + 50.0f) / 100.0f);
+        swprintf(b, n, L"+%d dB", db);
+        break;
+    }                                                          // 脚步增强
+    default:
         if (p <= 0) swprintf(b, n, L"静音");
         else {
-            int pct = (p < 10) ? 1 : (p + 5) / 10;   // 位置 1 就是 1%（= -18 dBFS），别显示成 0%
+            int pct = (p < 10) ? 1 : (p + 5) / 10;   // 位置 1 就是 1%（= -36 dBFS），别显示成 0%
             swprintf(b, n, L"%d%%", pct);
         }
         break;
@@ -412,7 +537,7 @@ static std::wstring AppDataPath() {
 static struct SavedState {
     bool valid = false;
     int  a = 1, b = 1;
-    int  envAmt = 55, envThr = 18, stepAmt = 65, stepSens = 70, ceil = 950;
+    int  envAmt = 55, stepAmt = 65, ceil = 950;
     int  capSel = -1, renSel = -1;
     int  loop = 0;
     int  pin = 0;
@@ -422,9 +547,8 @@ static void SaveConfig() {
     if (!g_saved.valid) return;
     FILE* f = _wfopen(AppDataPath().c_str(), L"w");
     if (!f) return;
-    fprintf(f, "a_on=%d\nb_on=%d\nenv_amt=%d\nenv_thr=%d\nstep_amt=%d\nstep_sens=%d\nceil=%d\n",
-            g_saved.a, g_saved.b, g_saved.envAmt, g_saved.envThr,
-            g_saved.stepAmt, g_saved.stepSens, g_saved.ceil);
+    fprintf(f, "a_on=%d\nb_on=%d\nenv_amt=%d\nstep_amt=%d\nceil=%d\n",
+            g_saved.a, g_saved.b, g_saved.envAmt, g_saved.stepAmt, g_saved.ceil);
     if (g_saved.capSel >= 0) fprintf(f, "cap_sel=%d\n", g_saved.capSel);
     if (g_saved.renSel >= 0) fprintf(f, "ren_sel=%d\n", g_saved.renSel);
     fprintf(f, "loopback=%d\n", g_saved.loop);
@@ -443,10 +567,8 @@ static void LoadConfig() {
         if (!strcmp(k, "a_on")) SendMessageW(g_hA, BM_SETCHECK, v ? BST_CHECKED : BST_UNCHECKED, 0);
         else if (!strcmp(k, "b_on")) SendMessageW(g_hB, BM_SETCHECK, v ? BST_CHECKED : BST_UNCHECKED, 0);
         else if (!strcmp(k, "env_amt")) SliderSet(0, v);
-        else if (!strcmp(k, "env_thr")) SliderSet(1, v);
-        else if (!strcmp(k, "step_amt")) SliderSet(2, v);
-        else if (!strcmp(k, "step_sens")) SliderSet(3, v);
-        else if (!strcmp(k, "ceil")) SliderSet(4, v);
+        else if (!strcmp(k, "step_amt")) SliderSet(1, v);
+        else if (!strcmp(k, "ceil")) SliderSet(2, v);
         else if (!strcmp(k, "cap_sel")) capSel = v;
         else if (!strcmp(k, "ren_sel")) renSel = v;
         else if (!strcmp(k, "loopback")) SendMessageW(g_hLoop, BM_SETCHECK, v ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -458,10 +580,10 @@ static void LoadConfig() {
 }
 
 static void UpdateLabels() {
-    HWND* lbl[5] = { &g_hLblEnvAmt, &g_hLblEnvThr, &g_hLblStepAmt, &g_hLblStepSens, &g_hLblCeil };
-    const wchar_t* names[5] = { L"环境抑制", L"环境阈值", L"脚步增强", L"瞬态灵敏度", L"最大输出" };
+    HWND* lbl[3] = { &g_hLblEnvAmt, &g_hLblStepAmt, &g_hLblCeil };
+    const wchar_t* names[3] = { L"环境抑制", L"脚步增强", L"最大输出" };
     wchar_t b[64];
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 3; ++i) {
         FormatValue(i, b, 64);
         std::wstring t = std::wstring(names[i]) + L"   " + b;
         SetWindowTextW(*lbl[i], t.c_str());
@@ -474,10 +596,8 @@ static void PushParams() {
     g_saved.b        = (int)SendMessageW(g_hB, BM_GETCHECK, 0, 0) == BST_CHECKED;
     g_saved.loop     = (int)SendMessageW(g_hLoop, BM_GETCHECK, 0, 0) == BST_CHECKED;
     g_saved.envAmt   = SliderPos(0);
-    g_saved.envThr   = SliderPos(1);
-    g_saved.stepAmt  = SliderPos(2);
-    g_saved.stepSens = SliderPos(3);
-    g_saved.ceil     = SliderPos(4);
+    g_saved.stepAmt  = SliderPos(1);
+    g_saved.ceil     = SliderPos(2);
     {
         int ci = (int)SendMessageW(g_hCap, CB_GETCURSEL, 0, 0);
         int ri = (int)SendMessageW(g_hRen, CB_GETCURSEL, 0, 0);
@@ -488,10 +608,8 @@ static void PushParams() {
     g_params.aOn      = SendMessageW(g_hA, BM_GETCHECK, 0, 0) == BST_CHECKED;
     g_params.bOn      = SendMessageW(g_hB, BM_GETCHECK, 0, 0) == BST_CHECKED;
     g_params.envAmt   = SliderPos(0) / 100.0f;
-    g_params.envThrDb = -60.0f + (float)SliderPos(1);
-    g_params.stepAmt  = SliderPos(2) / 100.0f;
-    g_params.stepSens = SliderPos(3) / 100.0f;
-    g_params.ceilDb   = CeilPosToDb(SliderPos(4));
+    g_params.stepAmt  = SliderPos(1) / 100.0f;
+    g_params.ceilDb   = CeilPosToDb(SliderPos(2));
     g_dsp.SetParams(g_params);
     UpdateLabels();
     if (g_popup) InvalidateRect(g_popup, nullptr, FALSE);
@@ -531,11 +649,9 @@ static void ResetDefaults() {
     SendMessageW(g_hA, BM_SETCHECK, BST_CHECKED, 0);
     SendMessageW(g_hB, BM_SETCHECK, BST_CHECKED, 0);
     SliderSet(0, 55);
-    SliderSet(1, 18);
-    SliderSet(2, 65);
-    SliderSet(3, 70);
-    SliderSet(4, 950);
-    for (int i = 0; i < 5; ++i) InvalidateRect(SliderCtl(i), nullptr, FALSE);
+    SliderSet(1, 65);
+    SliderSet(2, 950);
+    for (int i = 0; i < 3; ++i) InvalidateRect(SliderCtl(i), nullptr, FALSE);
     PushParams();
 }
 
@@ -669,7 +785,7 @@ static RECT TrayRect() {
 }
 
 
-static const wchar_t* g_slName[5] = { L"环境抑制", L"环境阈值", L"脚步增强", L"瞬态灵敏度", L"最大输出" };
+static const wchar_t* g_slName[3] = { L"环境抑制", L"脚步增强", L"最大输出" };
 static HWND g_hLblCap, g_hLblRen;
 
 // ---- 自适应布局：先测内容尺寸定窗口，再用真实 client 宽高摆控件 ----
@@ -700,9 +816,9 @@ static void LayoutPopupIn(HWND h, int cw, int ch) {
     MoveWindow(g_hQ1, pad + kW - qs, y + (S(24) - qs) / 2, qs, qs, TRUE);
     y += S(28);
 
-    HWND sl[4] = { g_hEnvAmt, g_hEnvThr, g_hStepAmt, g_hStepSens };
-    HWND lb[4] = { g_hLblEnvAmt, g_hLblEnvThr, g_hLblStepAmt, g_hLblStepSens };
-    for (int k = 0; k < 4; ++k) {
+    HWND sl[2] = { g_hEnvAmt, g_hStepAmt };
+    HWND lb[2] = { g_hLblEnvAmt, g_hLblStepAmt };
+    for (int k = 0; k < 2; ++k) {
         MoveWindow(lb[k], pad + ind, y, kW - ind, S(18), TRUE);
         MoveWindow(sl[k], pad + ind, y + S(18), kW - ind * 2, S(24), TRUE);
         y += S(44);
@@ -741,9 +857,9 @@ static void PopupContentSize(HWND h, int& cw, int& ch) {
     int w = MeasureText(h, g_fBtn, L"降低环境音 + 强化脚步声") + S(28) + S(30);
     int w2 = MeasureText(h, g_fBtn, L"锁定最大输出音量") + S(28) + S(30);
     if (w2 > w) w = w2;
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 3; ++i) {
         wchar_t t[96];
-        const wchar_t* ph = (i == 4) ? L"100%" : (i == 1 ? L"-60 dBFS" : L"100 %");
+        const wchar_t* ph = (i == 2) ? L"100%" : L"100 %";
         swprintf(t, 96, L"%s   %s", g_slName[i], ph);
         int lw = MeasureText(h, g_fLabel, t) + S(30);
         if (lw > w) w = lw;
@@ -753,7 +869,7 @@ static void PopupContentSize(HWND h, int& cw, int& ch) {
     if (w < S(250)) w = S(250);
 
     cw = w + pad * 2;
-    ch = S(10) + S(28) + S(44) * 4 + S(28) + S(18) + S(24) + S(5) + S(24) + S(10)
+    ch = S(10) + S(28) + S(44) * 2 + S(28) + S(18) + S(24) + S(5) + S(24) + S(10)
        + S(18) + S(30) + S(18) + S(30) + S(22) + S(10);
 }
 
@@ -844,14 +960,10 @@ static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetFont(g_hA, g_fBtn);
         SendMessageW(g_hA, BM_SETCHECK, BST_CHECKED, 0);
 
-        g_hLblEnvAmt   = mkLabel(L"");
-        g_hEnvAmt      = mkSlider(IDC_ENVAMT, 0, 100, 55);
-        g_hLblEnvThr   = mkLabel(L"");
-        g_hEnvThr      = mkSlider(IDC_ENVTHR, 0, 42, 18);
-        g_hLblStepAmt  = mkLabel(L"");
-        g_hStepAmt     = mkSlider(IDC_STEPAMT, 0, 100, 65);
-        g_hLblStepSens = mkLabel(L"");
-        g_hStepSens    = mkSlider(IDC_STEPSENS, 0, 100, 70);
+        g_hLblEnvAmt  = mkLabel(L"");
+        g_hEnvAmt     = mkSlider(IDC_ENVAMT, 0, 100, 55);
+        g_hLblStepAmt = mkLabel(L"");
+        g_hStepAmt    = mkSlider(IDC_STEPAMT, 0, 100, 65);
 
         g_hB = CreateWindowExW(0, L"BUTTON", L"锁定最大输出音量",
                                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
@@ -859,44 +971,19 @@ static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetFont(g_hB, g_fBtn);
         SendMessageW(g_hB, BM_SETCHECK, BST_CHECKED, 0);
 
-        // 问号说明：鼠标悬浮显示下面几条滑杆对 PUBG 声音的影响
-        auto mkQ = [&](const wchar_t* tip) {
+        // 问号说明：鼠标悬浮时由 33 ms 心跳驱动自绘气泡（TipTick），文案在 TipTextOf
+        auto mkQ = [&]() {
             HWND q = CreateWindowExW(0, L"STATIC", L"?",
-                                     WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_CENTER | SS_CENTERIMAGE,
+                                     WS_CHILD | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE,
                                      0, 0, S(20), S(20), h, nullptr, g_hinst, nullptr);
             SetFont(q, g_fLabel);
-            if (g_tip) {
-                TOOLINFOW ti{};
-                ti.cbSize = sizeof(ti);
-                ti.uFlags = TTF_SUBCLASS | TTF_IDISHWND;   // uId 直接放窗口句柄，否则提示会挂到父窗口上
-                ti.hwnd   = h;
-                ti.uId    = (UINT_PTR)q;
-                ti.lpszText = (LPWSTR)tip;
-                SendMessageW(g_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
-            }
             return q;
         };
-        g_tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP,
-                                0, 0, 0, 0, h, nullptr, g_hinst, nullptr);
-        if (g_tip) {
-            SendMessageW(g_tip, TTM_SETMAXTIPWIDTH, 0, S(320));
-            SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_INITIAL, 200);    // 悬停 0.2 s 弹出
-            SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 600000); // 停留期间不自动关
-            SendMessageW(g_tip, TTM_SETDELAYTIME, TTDT_RESHOW, 100);
-            ThemeTooltip();
-        }
-        g_hQ1 = mkQ(L"\u9648\u4f4e\u73af\u5883\u97f3 + \u5f3a\u5316\u811a\u6b65\u58f0\n"
-                    L"\n"
-                    L"\u73af\u5883\u6291\u5236\uff1a\u538b\u4f4e 20-150 Hz\uff08\u7206\u70b8\u8f6f\u9e23\u3001\u8f7d\u5177\u5f15\u64ce\u3001\u8fdc\u5904\u70ae\u58f0\uff09\u3002\u8c03\u9ad8\u66f4\u5e72\u51c0\uff0c\u4f46\u7206\u70b8\u51b2\u51fb\u611f\u53d8\u5f31\u3002\n"
-                    L"\u73af\u5883\u9608\u503c\uff1a\u4f4e\u4e8e\u8fd9\u4e2a\u7535\u5e73\u7684\u4f4e\u9891\u624d\u7b97\u73af\u5883\uff0c\u4f1a\u88ab\u989d\u5916\u538b\u4f4e\uff1b\u9ad8\u4e8e\u5b83\u89c6\u4e3a\u5b9e\u97f3\u4fdd\u7559\u3002\n"
-                    L"\u811a\u6b65\u589e\u5f3a\uff1a\u62ac\u9ad8 150 Hz \u4ee5\u4e0a\uff0c\u5176\u4e2d 0.6-3k\uff08\u811a\u6b65\u4e3b\u4f53\uff09\u62ac\u5f97\u6700\u591a\uff0c3-16k \u62ac\u4e00\u534a\u3002\n"
-                    L"\u77ac\u6001\u7075\u654f\u5ea6\uff1a\u591a\u5c0f\u7684\u54cd\u52a8\u624d\u89e6\u53d1\u589e\u5f3a\u3002\u9ad8=\u8f7b\u811a\u6b65\u4e5f\u6293\u5f97\u5230\uff0c\u4f4e=\u53ea\u6709\u5f00\u67aa\u7206\u70b8\u624d\u89e6\u53d1\u3002");
-        g_hQ2 = mkQ(L"\u9501\u5b9a\u6700\u5927\u8f93\u51fa\u97f3\u91cf\n"
-                    L"\n"
-                    L"\u6700\u5927\u8f93\u51fa\uff1a\u8f93\u51fa\u5cf0\u503c\u7684\u5929\u82b1\u677f\u3002\u8d85\u8fc7\u7684\u90e8\u5206\u77ac\u95f4\u538b\u5230\u8fd9\u6761\u7ebf\uff0c80 ms \u540e\u6062\u590d\u3002\n"
-                    L"100% = 0 dBFS \u4e0d\u9650\u5236\uff1b1% = -18 dBFS\uff1b0% = \u9759\u97f3\u3002\n"
-                    L"\u8d85\u8fc7\u5f97\u591a\u538b\u5f97\u8d8a\u591a\uff0c\u4f46\u97f3\u8272\u4e0d\u53d8\uff08\u6574\u6761\u4fe1\u53f7\u540c\u4e00\u4e2a\u589e\u76ca\uff09\u3002\n"
-                    L"\u4e5f\u53ef\u4ee5\u76f4\u63a5\u5728\u4e0b\u65b9\u7684\u7535\u5e73\u67f1\u4e0a\u6309\u4f4f\u5de6\u53f3\u62d6\u52a8\u6765\u8bbe\u7f6e\u3002");
+        g_bubble = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                   L"SoundLatchBubble", nullptr, WS_POPUP,
+                                   0, 0, 0, 0, h, nullptr, g_hinst, nullptr);
+        g_hQ1 = mkQ();
+        g_hQ2 = mkQ();
 
         g_hLblCeil = mkLabel(L"");
         g_hCeil    = mkSlider(IDC_CEIL, 0, kCeilPosMax, 950);
@@ -1059,6 +1146,7 @@ static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_TIMER:
         if (w == 1) {
+            TipTick();                 // 问号气泡显隐（自绘，不受系统 tooltip 超时影响）
             if (g_hMeter) InvalidateRect(g_hMeter, nullptr, FALSE);
             return 0;
         }
@@ -1077,6 +1165,7 @@ static void HidePopup() {
     if (!g_popupShown && !IsWindowVisible(g_popup)) return;
     reentering = true;
     g_popupShown = false;                // 先改状态，再隐藏
+    TipReset();                          // 气泡是独立顶层窗，面板收起时必须跟着走
     ShowWindow(g_popup, SW_HIDE);
     SaveConfig();                        // 收起面板就落盘，避免被强制结束进程时丢参数
     reentering = false;
@@ -1141,8 +1230,8 @@ static void ShowPopup(bool activate = true) {
 
 // ----------------------------------------------------------------- meter
 // 标尺：kMeterMinDb .. kMeterMaxDb 线性映射到 0..1（常量在文件上方与限幅阈值共用）。
-// 左端 -18 dBFS、右端 0 dBFS，和「最大输出」滑杆同域：滑杆 1% 就在柱形最左。
-// 低于 -18 dBFS 的信号画 1px 短条，表示"有声音但在标尺外"。
+// 左端 -36 dBFS、右端 0 dBFS，和「最大输出」滑杆同域：滑杆 1% 就在柱形最左。
+// 低于 -36 dBFS 的信号画 1px 短条，表示"有声音但在标尺外"。
 static constexpr float kMeterRelease = 0.55f;   // 回落速度（标尺比例/秒，约 36 dB/s）
 
 static inline float Clamp01f(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
@@ -1204,8 +1293,8 @@ static void SetCeilFromMeter(HWND h, int x) {
     float t  = Clamp01f((float)(x - rc.left) / (float)W);
     int pos  = (t < 0.02f) ? 0                                   // 最左一小段 = 静音（拖到底）
                            : CeilDbToPos(kMeterMinDb + t * (kMeterMaxDb - kMeterMinDb));
-    if (pos == SliderPos(4)) return;
-    SliderSet(4, pos);
+    if (pos == SliderPos(2)) return;
+    SliderSet(2, pos);
     if (g_hCeil) InvalidateRect(g_hCeil, nullptr, FALSE);
     PushParams();
 }
@@ -1231,9 +1320,10 @@ static LRESULT CALLBACK MeterProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             // 直角槽：按需求不做圆角，填充、柱形、边框全是方角
             FillR(dc, tr, trackBg);
 
-            // 参考刻度：-16 / -12 / -8 / -4 dBFS（0 dBFS 就是右边界）
+            // 参考刻度：-32 / -24 / -16 / -8 dBFS（0 dBFS 就是右边界）
+            // 标尺扩到 -36..0 后必须重排刻度，否则 4 条线全挤在右半边。
             {
-                const float tks[4] = { -16.f, -12.f, -8.f, -4.f };
+                const float tks[4] = { -32.f, -24.f, -16.f, -8.f };
                 for (int i = 0; i < 4; ++i) {
                     int x = tr.left + (int)(MeterNormDb(tks[i]) * W + 0.5f);
                     if (x >= tr.right - 1) x = tr.right - 1;
@@ -1252,7 +1342,7 @@ static LRESULT CALLBACK MeterProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             const float over    = raw > thrN ? raw : body;
             int xBody  = (int)(body * W + 0.5f);
             int xOver  = (int)(over * W + 0.5f);
-            // 低于标尺左端（<-18 dBFS）也给 1px：看得出"有信号，只是在范围外"
+            // 低于标尺左端（<-36 dBFS）也给 1px：看得出"有信号，只是在范围外"
             if (xBody < 1 && body > 0.001f) xBody = 1;
             if (xOver < 1 && over > 0.001f) xOver = 1;
             if (xBody > W) xBody = W;
@@ -1366,10 +1456,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             MeterTick();
             if (g_hMeter) InvalidateRect(g_hMeter, nullptr, FALSE);
             static int tick = 0;
-            if (g_running && ++tick % 1800 == 0)     // 每 ~60 s 记一次运行状态，便于排查
-                slLog(L"run: lat=%.1fms cap=%.1f ring=%.1f ren=%.1f lvl=%.3f under=%d",
+            if (g_running && ++tick % 1800 == 0) {     // 每 ~60 s 记一次运行状态，便于排查
+                long clip = g_dsp.ClippedSamples();
+                g_dsp.ResetClipCount();
+                slLog(L"run: lat=%.1fms cap=%.1f ring=%.1f ren=%.1f lvl=%.3f under=%d clip=%ld",
                       g_engine.LatencyMs(), g_engine.CapBufMs(), g_engine.RingMs(),
-                      g_engine.RenBufMs(), g_meterLevel, g_engine.Underruns());
+                      g_engine.RenBufMs(), g_meterLevel, g_engine.Underruns(), clip);
+                if (clip > 0)
+                    slLog(L"  >>>检出 %ld 个削顶/非有限样本 —— 限幅未兜住，检查「最大输出」是否过低或输入有 NaN", clip);
+            }
             return 0;
         }
         if (w == 9) {                  // 启动后静默建好面板（不开窗），只为了把引擎跑起来
@@ -1485,6 +1580,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     mc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     mc.lpszClassName = L"SLMETER";
     RegisterClassExW(&mc);
+
+    WNDCLASSEXW bc{};
+    bc.cbSize = sizeof(bc);
+    bc.lpfnWndProc = BubbleProc;
+    bc.hInstance = hInst;
+    bc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    bc.lpszClassName = L"SoundLatchBubble";
+    RegisterClassExW(&bc);
 
     // 隐藏的消息窗口：只做托盘图标与定时器的宿主，界面上不存在
     g_hwnd = CreateWindowExW(0, L"SoundLatchWnd", L"SoundLatch",
