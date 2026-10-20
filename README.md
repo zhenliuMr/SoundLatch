@@ -183,6 +183,15 @@ build.bat
 tests\dsp_test.exe
 ```
 
+`build.bat` 一次产出两个文件（版本号自动取自 `res/app.rc` 的 `SL_VER_STR`）：
+
+| 文件 | 用途 |
+|---|---|
+| `dist/SoundLatch.exe` | 固定名，本地调试用 |
+| `dist/SoundLatch-<版本>-x64.exe` | 发行副本，下载按钮与 Release 资产用的就是这个名字 |
+
+> 之前这两步是手工复制，容易和 `res/app.rc` 里的版本号对不上；现在由构建脚本生成，单一来源。
+
 ## 6. 常见问题
 
 | 现象 | 原因 |

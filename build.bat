@@ -24,4 +24,15 @@ if errorlevel 1 (
 )
 strip dist\SoundLatch.exe
 for %%F in (dist\SoundLatch.exe) do echo OK: %%~fF  %%~zF bytes
+
+rem Release asset copy: name carries the version because the README download
+rem button and the GitHub release asset use exactly this filename.
+rem Version is read from res\app.rc so there is a single source of truth.
+for /f "tokens=3" %%V in ('findstr /c:"#define SL_VER_STR" res\app.rc') do set "SLVER=%%~V"
+if defined SLVER (
+  copy /y dist\SoundLatch.exe "dist\SoundLatch-%SLVER%-x64.exe" >nul
+  echo OK: dist\SoundLatch-%SLVER%-x64.exe  ^(release asset^)
+) else (
+  echo WARN: SL_VER_STR not found in res\app.rc, skipped release copy
+)
 endlocal
