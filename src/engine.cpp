@@ -374,15 +374,23 @@ void AudioEngine::RenderLoop() {
 
             // ---- async sample-rate conversion (input domain -> 48k output)
             // compaction keeps only the fractional cursor, so phase stays continuous
+            //
+            // 必须夹住 n <= inLen_：来源断流时（回环捕获在端点没有活动流时
+            // 一个包都不给）下面的取样循环仍在让 cur_ 递增，很快就会跑到
+            // inLen_ 前面。此时 (inLen_ - n) 会下溢成接近 SIZE_MAX 的
+            // size_t，memmove 直接踩穿 → 0xC0000005 in ucrtbase（实测复现）。
             {
                 size_t n = (size_t)cur_;
+                if (n > inLen_) n = inLen_;
                 if (n > 0) {
                     memmove(inBuf_.data(), inBuf_.data() + n * 2, (inLen_ - n) * 2 * sizeof(float));
                     inLen_ -= n;
                     cur_ -= (double)n;
+                    if (cur_ < 0.0) cur_ = 0.0;
                 }
             }
             size_t capFrames = inBuf_.size() / 2;
+            if (inLen_ + 2 >= capFrames) inLen_ = capFrames - 2;   // 防止 want 下溢
             // fill the staging buffer aggressively; it is the reservoir the ASRC
             // servos on, not the thin ring between the two threads
             size_t want = capFrames - 2 - inLen_;
@@ -432,6 +440,9 @@ void AudioEngine::RenderLoop() {
                 f[k * 2 + 1] = sR * duck;
                 cur_ += ratio_;
             }
+            // 饿死时不让游标越过已缓冲数据：否则它会在每个回调里继续增长，
+            // 数据恢复后要花很久才追上（并且是下一步 memmove 下溢的源头）
+            if (cur_ > (double)inLen_) cur_ = (double)inLen_;
             duck_ = duck;
             if (starved) {
                 underruns_.fetch_add(1);

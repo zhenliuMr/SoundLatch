@@ -9,7 +9,7 @@
 [![release](https://img.shields.io/badge/release-v1.3.0-D4537E?style=flat-square)](https://github.com/zhenliuMr/SoundLatch/releases/tag/v1.3.0)
 [![platform](https://img.shields.io/badge/platform-Windows%20x64-0078D4?style=flat-square)](https://github.com/zhenliuMr/SoundLatch)
 [![language](https://img.shields.io/badge/language-C%2B%2B20%7C%20Win32-00599C?style=flat-square)](https://github.com/zhenliuMr/SoundLatch)
-[![size](https://img.shields.io/badge/exe-413%20KiB-5F5F5F?style=flat-square)](https://github.com/zhenliuMr/SoundLatch/releases/tag/v1.3.0)
+[![size](https://img.shields.io/badge/exe-414%20KiB-5F5F5F?style=flat-square)](https://github.com/zhenliuMr/SoundLatch/releases/tag/v1.3.0)
 
 [![cpu](https://img.shields.io/badge/DSP%20CPU-0.36%25-3B6D11?style=flat-square)](https://github.com/zhenliuMr/SoundLatch)
 [![latency](https://img.shields.io/badge/算法延迟-0.67%20ms-3B6D11?style=flat-square)](https://github.com/zhenliuMr/SoundLatch)
@@ -162,6 +162,7 @@ src/       dsp.h  engine.cpp/.h  main.cpp
 tests/     dsp_test.cpp overshoot_test.cpp        离线验收 12 项 + 限幅溢出审计
            audit_*.cpp  duck_test.cpp             DSP / 引擎 / 并发审计探针
            engine_glitch_test.cpp starve_test.cpp  引擎异常场景
+           loopback_repro.cpp                    回环捕获断流复现（无 UI）
 tools/     carve.py carve_check.py features.py       素材抽取与抽取质量复核
            pick_samples.js coverage.js               素材分层与覆盖统计
            analyze_sounds.py                         按频谱把素材分 6 类（docs/01 那张表）
