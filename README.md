@@ -193,6 +193,11 @@ tests\dsp_test.exe
 
 > 之前这两步是手工复制，容易和 `res/app.rc` 里的版本号对不上；现在由构建脚本生成，单一来源。
 
+**签名（可选）**：`tools\sign.bat cert.pfx <密码>` —— SHA256 + RFC3161 时间戳，签完自动刷新发行副本。
+需要**代码签名证书**：自签名只能证明"签名后没被改过"，SmartScreen 仍显示"未知发布者"
+（`signtool verify /pa` 会报 `root certificate which is not trusted`）；要在用户机器上免警告，
+得用公共 CA 的 OV/EV 证书或 Azure Trusted Signing。
+
 ## 6. 常见问题
 
 | 现象 | 原因 |
