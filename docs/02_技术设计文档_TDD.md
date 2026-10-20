@@ -114,7 +114,7 @@
                         └───────────┬────────────────┘
                                     │ 共享内存（参数/电平）
                         ┌───────────▼────────────────┐
-                        │  UI（同进程，Win32 + GDI）  │
+                        │  UI 进程 (Win32 + D2D)     │
                         │  开关A / 阈值 / 开关B / 表 │
                         └────────────────────────────┘
 ```
@@ -126,74 +126,71 @@
 
 ## 4. DSP 内核设计
 
-### 4.1 处理链（与 `src/dsp.h` 一致）
+### 4.1 处理链
 
 ```
-in → 4 段 Linkwitz-Riley LR4 分频(150/600/3000 Hz，全通相位补偿)
-     ├─ band0 (<150)   ：-20 dB × envAmt × envGate(谱倾斜) + 枪声 duck
-     ├─ band1 (150-600)：-7 dB × envAmt × envGate + 脚步增强 3.6 dB
-     ├─ band2 (0.6-3k) ：脚步增强 12 dB（不动环境抑制，也不被 duck 碰）
-     └─ band3 (>3k)    ：脚步增强 5.4 dB + 枪声 duck
-     → 求和 → 1 个控制块(32 样本 ≈0.67 ms)前视砖墙限幅 → 硬钳位兜底 → out
+in → DC Block → 分频(LR4, 150/600/3000) → B1/B2/B3/B4
+      ├─ B1: 静态搁架衰减 + 向下扩展(稳态环境抑制)
+      ├─ B2/B3/B4: 瞬态检测门控的向上增益 + 稳态向下扩展
+      → 求和 → 输出限幅器(开关B) → 软削波保护 → out
 ```
-
-三组判据的强度都是 0..1 的连续量，乘在各自的 dB 增益上，再按控制块线性斜坡。
 
 ### 4.2 分频
 
-- **Linkwitz-Riley 4 阶**（两级 Butterworth 级联），相位对齐、求和平坦（实测 20 Hz–20 kHz 最大起伏 −0.173 dB）。
-- 全部 IIR，**零额外延迟**；不使用线性相位 FIR。
-- 相位补偿：band0 串 `ap600 + ap3k`，band1 串 `ap3kb`，四段相加才平。
+- **Linkwitz-Riley 4 阶**（两级 Butterworth 级联），相位对齐、求和平坦；**IIR 因果，零延迟**。
+- 禁止使用线性相位 FIR（会引入 (N-1)/2 采样延迟，违背 G3）。
+- 系数在 48 kHz 下预计算，切换采样率时重算；用 TDF-II 结构保证数值稳定。
 
-### 4.3 判据（全部与绝对电平无关）
+### 4.3 包络与瞬态检测
 
-| 判据 | 定义 | 门限 | 作用 |
-|---|---|---|---|
-| ① 谱倾斜 | `tilt = L0 − mean(L1,L2)`（dB） | 11 → 22 dB 满档 | 低频独大 → 压 band0/band1（环境隆隆、载具） |
-| ② 瞬态频段分布 | `trSm = clamp((tM−2)/12) × clamp((tM−tL−4)/6)` | 中频瞬态比低频陡 4 dB | 抬 band1/2/3（脚步主体） |
-| ③ 枪声事件 | `f3 = E(>5k)/E(全带)` × `tAll = fast−slow` | 0.20→0.36 / 6→14 dB | 只压 band0/band3（轰头与炸耳） |
+```
+Efast: |x| 一阶低通，τa = 3 ms
+Eslow: |x| 一阶低通，τa = 150 ms
+T_dB  = 20log10(Efast) - 20log10(Eslow)      // 瞬态度
+g_tr  = clamp((T_dB - TrSens) / 12, 0, 1)    // TrSens = 瞬态灵敏度阈值滑杆
+```
 
-- 包络：fast 3 ms、slow 150 ms；band 级 5 ms / 120 ms。
-- 判据 ③ 额外要求：本块输入峰值 ≥ 0.98 × 上限（**峰值门控**），且 `trSm > 0.25` 时不做（与判据 ② 互斥）。
-- 判据 ③ 的快攻慢放：4 ms 压、180 ms 放，深度 4 dB。
-- 常数固化在 `src/dsp.h` 的 `namespace judge` / `namespace duck`，面板不暴露。
+- 脚步特征：`T_dB` 在起音 10 ms 内冲到 **15–30 dB**，随后 100 ms 内衰减；环境音 `T_dB < 6 dB`。
+- `g_tr` 经 5 ms attack / 120 ms release 平滑，避免"抽气"。
 
-> 为什么 ③ 不能"识别枪声"：全量 11 043 条素材实测，52 % 的文件都含明亮宽带瞬态（枪声/破片/玻璃/弹壳），
-> 频段占比分不开。所以 ③ 的定位是「信号确实顶到天花板时替限幅器分担」，靠峰值门控兜住误触发。
-
-### 4.4 增益映射（面板滑杆 → 实际参数）
+### 4.4 增益映射（用户滑杆 → 实际参数）
 
 | 滑杆 | 范围 | 映射 |
 |---|---|---|
-| 环境抑制 `envAmt` | 0–100 % | band0 `−20 dB × k`、band1 `−7 dB × k`（k = 百分比/100），再乘判据 ① 的 gate |
-| 脚步增强 `stepAmt` | 0–100 % | band1 `+3.6 dB × k`、band2 `+12 dB × k`、band3 `+5.4 dB × k`，再乘 `trSm` 与电平 guard |
-| 最大输出 `ceilDb` | 1 % = −36 dBFS … 100 % = 0 dBFS，0 % = 静音 | 限幅器绝对上限；同时是判据 ③ 峰值门控的参考 |
+| 环境抑制 `EnvAmt` | 0–100 % | `B1_gain = -18 dB × (EnvAmt/100)`（搁架 150 Hz）<br>`B1_floor = -12 dB × (EnvAmt/100)`（稳态向下扩展最大衰减） |
+| 环境阈值 `EnvThr` | -60 ~ -20 dBFS | B1 向下扩展阈值；低于阈值按 2:1 向下扩展 |
+| 脚步增强 `StepAmt` | 0–100 % | `B2 += 3 dB·k`，`B3 += 12 dB·k`，`B4 += 6 dB·k`（k = StepAmt/100） |
+| 脚步灵敏度 `StepSens` | 0–100 % | 映射 `TrSens = 6 dB → 0 dB`（越灵敏越容易触发） |
+| 限幅天花板 `Ceil` | -24 ~ 0 dBFS | 限幅器输出上限 |
+| 限幅启动 `Look` | 0.5–5 ms | lookahead，默认 1.5 ms |
 
-> guard = `clamp((−6 − bandLevel_dBFS)/12 + 1, 0, 1)`：该频段已经很响时自动收缩增强，防止把枪声顶爆。
+> 边界保护：B3 增益上限 +12 dB 时，若频段电平已 > -6 dBFS，则自动按 `1/(1+excess)` 收缩增益（防"提脚步把枪声顶爆"）。
 
 ### 4.5 输出限幅器（开关 B）
 
 ```
-延时线 D = lookahead × fs（默认 1.5 ms ≈ 72 样本）
-peak   = max(|x| 前视窗口)                 // 单调队列 O(1)
+延时线 D = lookahead × fs
+peak = max(|x| 前视窗口)              // 滑动最大值，单调队列 O(1)
 target = min(1, Ceil / peak)
-gain   = min(gain, target)                 // 瞬时压，无过冲
-gain  += (target − gain) × releaseCoef     // release 35 ms（v1.3.0 由 80 ms 缩短）
-out    = delayed × gain → clamp(±Ceil)     // 硬钳位兜底
+gain   = min(gain, target)            // 瞬时压，无过冲
+gain  += (target - gain) × releaseCoef // release 80 ms 平滑
+out    = delayed × gain
 ```
 
-- 硬保证 `|out| ≤ Ceil`：`tests/overshoot_test.exe` 6 组恶劣场景溢出 +0.00 dB（唯一 +0.01 dB 出现在 ceil=静音）。
-- 增益按**整条信号一个值**：不分频段，所以枪声期间整条混音同比例下降 —— 这正是 v1.3.0 引入判据 ③ 的原因。
-- 攻击由前视完成，不额外加缓冲。
+- 硬保证：`|out| ≤ Ceil`，**零过冲**（前视 + 单调队列）。
+- 软膝 3 dB，避免阈值附近"抽吸"。
+- 可选 2× 过采样峰值检测，防 inter-sample peak（默认关闭，省 CPU）。
+- 攻击时间由 lookahead 决定，**不引入额外缓冲**（在已存在的延时线内完成）。
 
-### 4.6 实测开销
+### 4.6 CPU / 内存预算
 
-| 项 | 实测 |
+| 项 | 估算 |
 |---|---|
-| 每样本 | 8 个 LR4 双二阶 ×2 声道 + 3 个全通 + 7 个包络 + 1 个 5 kHz 探测双二阶 |
-| CPU | **0.35 % 单核**（`tests/dsp_test.exe` T5：20 s 音频 70 ms） |
-| 进程常驻 | **17.7 MB** |
-| 全量离线 | 11 043 条 / 17.23 h，241× 实时（14 线程，瓶颈在解码器进程启动） |
+| Biquad 数 | 4 段 × 2（LR4 两级）× 2 声道 = 16 个双二阶 |
+| 每样本运算 | ≈ 16 × 5 mul/add ≈ 80 FLOP + 包络 ≈ 20 |
+| 48 kHz 立体声 | ≈ 9.6 MFLOPS ≈ **0.3–1.2 % 单核**（无 SIMD）；AVX2 可再降 2–4× |
+| 缓冲内存 | 环形缓冲 2 × 4096 帧 × 2ch × 4B ≈ 64 KB |
+| 进程常驻 | 引擎 ~8 MB + UI/ImGui/D3D11 ~12 MB → **目标 ≤ 30 MB** |
 
 ---
 
@@ -208,47 +205,54 @@ out    = delayed × gain → clamp(±Ceil)     // 硬钳位兜底
 7. **WASAPI 配置**：`ShareMode=Shared`、`AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUTOCONVERTPCM | SRC_DEFAULT_QUALITY`；优先 `IAudioClient3::InitializeSharedAudioStream` 请求 240 帧 period，失败回退 480 帧。
 8. **渲染端可请求独占**：提供"极限延迟"选项（独占 + 48 kHz/24 bit），失败自动回退共享。
 9. **时钟漂移**：捕获与渲染来自不同设备（CABLE vs 耳机），必须做 **drift 补偿**：以环形缓冲水位为目标（50 %），每 1024 帧最多调整 ±1 帧（≈ ±0.1 %，听感不可察）；水位 >85 % 或 <15 % 触发丢/补一帧，避免累积溢出。
-10. **异常保护**：MinGW 无 SEH，改为不抛异常 + `std::isfinite` 逐样本兜底；设备被拔/切换时 200 ms 内重建流并淡入。
+10. **异常保护**：`__try/__except`（MSVC SEH）包住回调；设备被拔/切换时 200 ms 内重建流并静音淡入。
 
 ---
 
+## 6. UI 设计（最小可用）
 
-## 6. UI（实际形态：托盘面板，不是主窗口）
+单窗口 ~420×320，D2D 自绘，无外部 UI 框架：
 
 ```
-托盘图标 ──左键──► 浮动面板（右下角向左上展开，无标题栏，客户区可拖动）
-          └右键──► 菜单：控制面板 / 退出
+┌─────────────────────────────────────────┐
+│  SoundLatch                    [—][□][×] │
+├─────────────────────────────────────────┤
+│  ① 脚步增强            [ ●────── ] ON   │
+│     环境抑制   ─────●──────   60 %      │
+│     环境阈值   ──●────────  -42 dBFS    │
+│     脚步增益   ───────●───   +8 dB      │
+│     瞬态灵敏度 ────●──────   70 %       │
+│                                         │
+│  ② 输出限幅            [ ●────── ] ON   │
+│     天花板     ──────────●  -3.0 dBFS   │
+│                                         │
+│  [实时电平] ▁▃▅▇▅▃▁  峰值 -6.2 dBFS     │
+│  设备: CABLE Output → 耳机 (Realtek)    │
+│  状态: 运行中 · 18 ms · CPU 0.9 %       │
+└─────────────────────────────────────────┘
 ```
 
-面板内容（自上而下）：
-
-| 区 | 控件 |
-|---|---|
-| 开关 1 | ☑ 降低环境音 + 强化脚步声 |
-| | 环境抑制 0–100 % ｜ 脚步增强 0–100 %（0…+12 dB） |
-| 开关 2 | ☑ 锁定最大输出音量 |
-| | 最大输出 1 % = −36 dBFS … 100 % = 0 dBFS（0 % = 静音） |
-| 电平 | 输入电平柱 + 上限游标（可直接在柱上拖阈值） |
-| 设备 | 采集（下拉，每次展开重新枚举）｜ 输出（下拉） |
-| 底部 | 回环捕获 ｜ 开机自启动 ｜ 固定到屏幕 ｜ 恢复默认 |
-
-- 全部控件原生 Win32 + GDI 自绘；深浅色跟随系统（uxtheme 私有 API + DWM），无第三方 UI 框架。
-- 改动立即生效，收起面板/退出时落盘 `%APPDATA%\SoundLatch\config.ini`（`key=value`，不是 JSON）。
-- 两个「？」由自绘气泡解释，不受系统 tooltip 超时影响。
-- 已知：首次启动只驻留托盘、不弹面板（v1.3.0 未改），见 `docs/04` 第 1 节。
+- 参数改动**立即生效**（无"应用"按钮），写入 `%APPDATA%\SoundLatch\config.json`。
+- 首次运行向导：检测 VB-Cable → 引导安装 → 自动把 PUBG 输出设为 CABLE Input → 选择耳机为渲染设备。
+- 提供 **A/B 对比**（勾选「旁通」临时旁路处理），供耳朵验收。热键功能已按需求移除。
 
 ---
 
-## 7. 技术栈与产物（实际）
+## 7. 技术栈与产物
 
-| 层 | 选型 | 说明 |
+| 层 | 选型 | 理由 |
 |---|---|---|
-| 语言 | C++20（MinGW-w64 g++ 16.2，`-O2 -municode -mwindows`） | 静态链接 libgcc/libstdc++，无运行库依赖 |
-| 音频 | WASAPI 共享模式 + MMCSS/AVRT | 独占模式实测被驱动拒绝，见 §11 |
-| UI | 原生 Win32 + GDI 自绘 | 无 ImGui / Direct2D / WebView |
-| 配置 | `%APPDATA%\SoundLatch\config.ini` | 纯文本 key=value |
-| 构建 | `build.bat`（windres + g++） | 一次产出单文件 exe |
-| 产物 | `dist/SoundLatch.exe` | 413 KiB，常驻 17.7 MB |
+| 语言 | C++20（MSVC 2022，/O2 /fp:fast） | 实时确定性、无 GC、单 exe |
+| 音频 | WASAPI（Core Audio）+ MMCSS/AVRT | 系统原生最低延迟路径 |
+| UI | Win32 + Direct2D + Dear ImGui (D3D11) | 体积极小（~300 KB），无 WebView 开销 |
+| 配置 | JSON（nlohmann/json, header-only） | 简单、可手改 |
+| 构建 | CMake 3.25+ | 一键出 Release |
+| 打包 | 单文件 exe + 可选静默安装脚本（含 VB-Cable 检测/引导） | 用户零配置 |
+| 测试 | GoogleTest（DSP 数值）+ 自研 Loopback 延迟测量工具 | 可回归 |
+
+**产物**：`SoundLatch.exe`（≤ 3 MB）、`config.json`、`INSTALL.md`。
+
+---
 
 ## 8. 风险登记
 
@@ -266,49 +270,42 @@ out    = delayed × gain → clamp(±Ceil)     // 硬钳位兜底
 
 ---
 
-## 9. 实际接口（与代码一致）
+## 9. 参考实现骨架
 
 ```cpp
-// dsp.h —— 无 Windows 依赖，可离线单测
-struct DspParams {
-    bool  aOn = true, bOn = true, bypass = false;
-    float envAmt = 0.55f, stepAmt = 0.65f;   // 0..1
-    float ceilDb = -3.0f, lookMs = 1.5f;
-};
+// dsp_core.h —— 无 Windows 依赖，可单测
+struct Params { float envAmt, envThrDb, stepAmt, stepSens, ceilDb, lookMs; bool aOn, bOn; };
 
 class DspCore {
 public:
-    void Prepare(float fs);                  // 48 kHz
-    void SetParams(const DspParams& p);      // UI 线程调用，uint64 原子打包，无撕裂
-    void Process(float* interleaved, int frames);  // 音频线程；无分配/锁/异常
-    // 观测用：LastTilt / LastTrSm / LastDuck / LastF3 / LastTAll / ClippedSamples
-    //           MeterPeak / MeterInPeak / TakePeak / TakeRms
+    void Prepare(double fs, int maxFrames);
+    // 实时安全：无分配、无锁、无异常
+    void Process(const float* in[2], float* out[2], int frames) noexcept;
+    void SetParams(const Params& p) noexcept;   // 每块调用，内部做平滑
+private:
+    Biquad  lp[4][2], hp[4][2];     // LR4 crossover
+    EnvF    fast[2], slow[2], band[4][2];
+    Limiter lim;
+    ParamSmoother sm;
 };
 ```
 
 ```cpp
-// engine.h —— WASAPI 双线程
-class AudioEngine {
-    bool Start(captureId, renderId, loopbackCapture, DspCore*, std::wstring& err);
-    void Stop();
-    float LatencyMs() const;   // 采集缓冲 + 环形水位 + 渲染缓冲 + 前视
-};
+// 瞬态门控增益（B3 示例）
+float tr = 20.f*log10f(fast + 1e-9f) - 20.f*log10f(slow + 1e-9f);
+float k  = clampf((tr - trSens) / 12.f, 0.f, 1.f);       // 0..1
+float g  = db2lin(stepGainDb[1] * k * levelGuard);        // levelGuard 防顶爆
+b3 = b3 * g;
 ```
 
 ---
 
-## 10. 验收口径（实际执行的）
+## 10. 验收口径（详见 03）
 
-| 项 | 判据 | 执行 |
-|---|---|---|
-| 限幅零过冲 | 6 组恶劣场景（含块内相位 0–31 全扫描）溢出 ≤ +0.01 dB | `tests/overshoot_test.exe` |
-| 分频平坦度 | 20 Hz–20 kHz 起伏 ≤ 0.5 dB（实测最大 −0.173 dB @21.4 Hz） | `tests/dsp_test.exe` T2 |
-| 环境抑制选择性 | 低频独大被压 ≥ 12 dB、脚步带 \|Δ\| < 3 dB；等幅/中频更大不压 | T3 / T3b |
-| 脚步增强 | 瞬态段 ≥ +6 dB，稳态段 ≈ 0 | T4 |
-| CPU | 20 s 音频处理 ≤ 1.5 % 单核（实测 0.35 %） | T5 |
-| 全量稳定性 | 11 043 条素材：削顶 0、非有限样本 0 | `tools/fullscan.exe` |
-
-延迟口径：**算法延迟 0.67 ms**（1 个控制块前视，脉冲法）；**链路延迟 63–79 ms**，由端点缓冲决定（本机 22 ms/端）。
+- 延迟：Loopback 脉冲法测 `in→out`，Mode A ≤ 20 ms、Mode B ≤ 4 ms（50 次均值，抖动 < 3 ms）。
+- CPU：PerfMon 采样 10 min，音频线程均值 ≤ 1.5 %。
+- 内存：Private Bytes ≤ 30 MB（运行 1 h 后）。
+- 听感：盲测 10 人，≥ 8 人认为"脚步更清晰且枪声不刺耳"。
 
 ---
 

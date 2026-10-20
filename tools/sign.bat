@@ -35,6 +35,6 @@ if errorlevel 1 (
   echo SIGN FAILED
   exit /b 1
 )
-copy /y dist\SoundLatch.exe "dist\SoundLatch-1.3.0-x64.exe" >nul
+copy /y dist\SoundLatch.exe "dist\SoundLatch-1.2.0-x64.exe" >nul
 %SIGNTOOL% verify /pa /v dist\SoundLatch.exe
 endlocal

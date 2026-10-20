@@ -13,7 +13,7 @@
 | 音频中间件 | **Wwise**（Audiokinetic）——RIFF 头标记 `metadata from: Audiokinetic Wwise RIFF header` |
 | 编码 | **Wwise Vorbis（Custom Vorbis）**，`fmt` 块长 0x42，codec = `0xFFFF` |
 | 采样率 | **48000 Hz**（`0xBB80`），单/双声道混存 |
-| 存储方式 | **未压缩直存**（可绕索引直接从数据区提取），故 pak 内的 Wwise 流可直接从数据区取出（去重后 12 023 条：11 043 条可解码入库，965 条 AES 加密、14 条解码器不支持，均已剔除） |
+| 存储方式 | **未压缩直存**（可绕索引直接从数据区提取），故 13590 条流可无损取出 |
 | 主要音频包 | `pakchunk0-WindowsNoEditor_sound.pak` = **3.0 GB**；`_mutable.pak` 5.3 GB（外观，非音频） |
 
 > 索引加密导致「脚步/枪声」文件名不可得，本报告采用**无声名、按声学特征聚类**的方法：从 `_sound.pak` 全盘提取 **13,590** 条 Wwise 流，均匀抽样 632 条 + 全长循环样本 85 条，解码后计算 Welch 功率谱、9 段倍频程能量、谱质心、10 ms 包络动态范围与瞬态密度。
@@ -80,7 +80,7 @@ B4  3000–16000Hz 脚步细节（草/砂/水）、枪声爆音、玻璃  → �
 
 ```bash
 # 1. 从 pak 中提取 Wwise 流（无需解密索引）
-python tools/carve.py            # -> samples/wem/*.wem  (11 043 条可解码；加密的 965 条记入 samples/encrypted.txt)
+python tools/carve.py            # -> samples/wem/*.wem  (13590 条)
 # 2. 解码 + 特征提取（依赖 vgmstream-cli、numpy、scipy）
 python tools/features.py         # -> samples/features.json
 ```

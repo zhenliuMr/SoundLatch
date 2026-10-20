@@ -4,8 +4,7 @@
 // Structure:
 //   input -> 4-band Linkwitz-Riley 4th order split (phase-compensated with allpass)
 //         -> per-band dynamic gain (downward expander for ambience,
-//            transient-gated upward expander for footsteps,
-//            gunshot-event duck on band0/band3 only - 150..3k stays untouched)
+//            transient-gated upward expander for footsteps)
 //         -> sum -> lookahead brickwall limiter -> out
 //
 // Gains are computed at control rate (32 samples) and linearly ramped,
@@ -189,37 +188,6 @@ constexpr float kBandRatio =  4.0f;   // dB，中频瞬态需比低频瞬态高�
 constexpr float kStepBoostMax = 12.0f; // dB，满档时中频最多抬 12 dB
 } // namespace judge
 
-// 枪声事件 duck —— 解决「一发枪声把整个场景压小声两三秒」。
-//
-// 为什么不用「只压 2–5k」：实测枪声 2–5k 只占能量 16–48%，压 12 dB 只换来
-// 1.3–2.8 dB 的感知下降（压不住炸耳），却把该频段内所有内容（含清脆型脚步 56.6%）
-// 一起拖下水；而真正掩蔽脚步的 250–2k 还占枪声能量 25–27%，完全没被处理。
-//
-// 改用事件级判定 + 只处理「炸耳」与「轰头」两端：
-//   判据① 高频占比 f3 = E(>3k)/E(全带)：枪声 0.35–0.47，脚步 0.04，环境 0.03
-//   判据② 全带瞬态 tAll = fast−slow：枪声起音 +20 dB 级，稳态再亮也不触发
-// 两个判据都是占比/相对量，与绝对电平无关，系统音量拉满也不会误触发。
-// 命中后只压 band0(<150) 与 band3(>3k)，band1/band2(150–3k) 一律不动 ——
-// 脚步主体与定位线索所在的那两段保持原电平，所以「脚步不会跟着沉」。
-namespace duck {
-constexpr float kF3On     = 0.20f;    // 高频占比门限
-constexpr float kF3Full   = 0.36f;    // 到这里的占比算满档
-constexpr float kTrigOn   =  6.0f;    // dB，全带瞬态门限
-constexpr float kTrigFull = 14.0f;    // dB，到这里算满档
-constexpr float kMaxDb    =  4.0f;    // dB，满档时 band0/band3 压多少（全量实测后由 6 降到 4）
-constexpr float kAttackMs =  4.0f;
-constexpr float kReleaseMs = 180.f;
-// 峰值门控：只有当输入本块确实顶到用户设的天花板才 duck。
-//
-// 为什么最终只保留这一层：全量 11 043 条素材实测，任何「频段占比 / 陡度 / 持续时长」
-// 的组合都分不开枪声与其它明亮瞬态 —— 素材库里 52 % 的文件 f3Max ≥ 0.40，35 % ≥ 0.60
-// （枪声、破片、弹壳、玻璃、金属撞击都是宽带陡起）。这是射击游戏的音效构成决定的，
-// 不是判据没调好。
-// 所以 duck 不再声称"识别枪声"，而是绑定到它真正的目的：**信号确实顶到天花板时，
-// 替限幅器分担一点**，只削 <150 Hz 与 >3 kHz 两端。没顶到天花板就一点都不动。
-constexpr float kPeakGate   = 0.98f;  // × ceil
-} // namespace duck
-
 // --------------------------------------------------------------- limiter
 class Limiter {
 public:
@@ -332,15 +300,9 @@ public:
         for (int b = 0; b < 4; ++b) { envB_[b].set(fs, 5.f, 120.f); gPrev_[b] = 1.f; gCur_[b] = 1.f; }
         envFast_.set(fs, 3.f, 3.f);
         envSlow_.set(fs, 150.f, 150.f);
-        // 枪声事件 duck 的快攻慢放（每个控制块用一次，所以按块长折算）
-        duckA_ = expf(-(float)kCB / (fs * duck::kAttackMs  * 0.001f));
-        duckR_ = expf(-(float)kCB / (fs * duck::kReleaseMs * 0.001f));
-        duckEnv_ = 0.f;
         // 低频/中频各自的快慢包络：用于瞬态的频段分布判据
         envFastL_.set(fs, 3.f, 3.f);   envSlowL_.set(fs, 150.f, 150.f);
         envFastM_.set(fs, 3.f, 3.f);   envSlowM_.set(fs, 150.f, 150.f);
-        hp5k_.setHP(fs, 5000.f, 0.70710678f);
-        envH_.set(fs, 3.f, 60.f);
         limiter_.prepare(fs);
         Reset();
     }
@@ -360,18 +322,12 @@ public:
         }
         // 注意：这个系数是"每个控制块"用一次（kCB=32 样本），所以要按块长折算，
         // 否则实际恢复时间会慢 32 倍（80 ms 变成 2.56 s，枪声后整条信号会被压低好几秒）
-        //
-        // 80 ms -> 35 ms：实测长尾枪声（3.21 s）在 -6 dBFS 上限下，80 ms 的释放让
-        // 整条尾音都停在压缩态（2.88 s 内增益回不到 -1 dB 以内）。35 ms 时压掉的
-        // 只是真正的峰，不再把尾音整段按下去。
-        relLimCoef_ = 1.0f - expf(-(float)kCB / (fs_ * 0.035f));
+        relLimCoef_ = 1.0f - expf(-(float)kCB / (fs_ * 0.080f));
         envFast_.reset(); envSlow_.reset();
         envFastL_.reset(); envSlowL_.reset();
         envFastM_.reset(); envSlowM_.reset();
-        hp5k_.reset(); envH_.reset();
         limiter_.reset();
         trSm_ = 0.f;
-        duckEnv_ = 0.f; duck_ = 0.f; overMs_ = 0.f;
         peakOut_ = 0.f; rmsAcc_ = 0.f; rmsN_ = 0;
         meterPeak_.store(0.f);
     }
@@ -410,10 +366,6 @@ public:
     // 供离线标定/测试观察判据内部量（实时路径不用）
     float LastTilt() const { return tilt_; }
     float LastTrSm() const { return trSm_; }
-    float LastDuck() const { return duck_; }   // 0..1，枪声事件 duck 的生效比例
-    float LastOverMs() const { return overMs_; }  // 连续过载时长（ms）
-    float LastF3()   const { return f3_; }     // 高频(>3k)能量占比
-    float LastTAll() const { return tAll_; }   // 全带快慢包络差 dB
 
     float MeterPeak() {
         float v = meterPeak_.load(std::memory_order_relaxed);
@@ -458,14 +410,6 @@ public:
         while (base < frames) {
             int n = std::min(kCB, frames - base);
             float bl[4][kCB], br[4][kCB];
-            // 本块输入的原始峰值（任何增益之前）——duck 的峰值门控用它，
-            // 用处理后的峰值会形成「duck 压低 → 门控关闭 → duck 放开」的自激
-            float inPk = 0.f;
-            for (int i = 0; i < n; ++i) {
-                float a = fabsf(io[2 * (base + i)]), b = fabsf(io[2 * (base + i) + 1]);
-                if (a > inPk) inPk = a;
-                if (b > inPk) inPk = b;
-            }
 
             for (int i = 0; i < n; ++i) {
                 float l = io[2 * (base + i)], r = io[2 * (base + i) + 1];
@@ -491,9 +435,6 @@ public:
                 float m = 0.5f * (l + r);
                 envFast_.proc(m);
                 envSlow_.proc(m);
-                // 5k 以上专门测一路：分频器的 band3 是 >3k，而「清脆脚步」在 3–5k
-                // 也有可观能量（实测占比 0.3–0.45，与枪声重叠），必须再往上切一刀才分得开。
-                envH_.proc(hp5k_.proc(m));
                 float mL = 0.5f * (bl[0][i] + br[0][i]);                // <150
                 float mM = 0.5f * (bl[1][i] + br[1][i]
                                  + bl[2][i] + br[2][i]);                // 150-3k
@@ -520,42 +461,13 @@ public:
             float trRatio = clampf((tM - tL - judge::kBandRatio) / 6.0f, 0.f, 1.f);
             trSm_ = trMid * trRatio;
 
-            // ---- 判据 3：枪声事件（只压 炸耳/轰头 两端，中频不动）
-            // f3 是高频占比（不是绝对电平）：稳态再亮但没瞬态也不会触发；
-            // tAll 是本块的快慢包络差，枪声的陡起才够。
-            float e3   = envB_[3].e;
-            float eAll = envB_[0].e + envB_[1].e + envB_[2].e + e3;
-            float f3   = (eAll > 1e-9f) ? clampf(envH_.e / eAll, 0.f, 1.f) : 0.f;
-            float tAll = linToDb(envFast_.e) - linToDb(envSlow_.e);
-            float dF3  = clampf((f3   - duck::kF3On)   / (duck::kF3Full   - duck::kF3On),   0.f, 1.f);
-            float dTr  = clampf((tAll - duck::kTrigOn) / (duck::kTrigFull - duck::kTrigOn), 0.f, 1.f);
-            float dTgt = dF3 * dTr;
-            // 与「脚步判据」互斥：中频瞬态明显强于低频瞬态（判据 2 命中）说明这是
-            // 脚步类事件，该抬不该压。实测枪声的 trSm 全程为 0（低频冲击压住中频瞬态），
-            // 所以这个互锁不会削弱对枪声的作用，只挡掉「清脆脚步被当成枪声」的误触发。
-            dTgt *= (1.f - clampf(trSm_ * 4.f, 0.f, 1.f));
-            // 峰值门控：没顶到天花板就一点都不动（见 namespace duck）
-            const float blockMs = (float)kCB * 1000.f / fs_;
-            overMs_ += (inPk >= ceilLin * duck::kPeakGate) ? blockMs : -blockMs;
-            overMs_ = clampf(overMs_, 0.f, 2000.f);      // 仅作观测用
-            if (inPk < ceilLin * duck::kPeakGate) dTgt = 0.f;
-            // 快攻慢放：起音 4 ms 内压下去，尾音结束后 180 ms 放开
-            duckEnv_ = (dTgt > duckEnv_) ? dTgt + (duckEnv_ - dTgt) * duckA_
-                                         : dTgt + (duckEnv_ - dTgt) * duckR_;
-            duck_ = duckEnv_;
-            f3_ = f3; tAll_ = tAll;
-            const float duckDb = -duck::kMaxDb * duckEnv_;
-
             for (int b = 0; b < 4; ++b) {
                 float edb = linToDb(envB_[b].e);
                 float gdb = 0.f;
                 if (p.aOn) {
-                    // 判据①：只压 band0/band1（环境隆隆），中高频是脚步主体，不动
+                    // 只压 band0/band1，band2/band3 是脚步主体，一律不动
                     if (b == 0)      gdb = -judge::kEnvCutMax * p.envAmt * envGate;
                     else if (b == 1) gdb = -judge::kEnvCutMid  * p.envAmt * envGate;
-                    // 判据③：枪声事件只动两端（轰头 <150、炸耳 >3k）。
-                    // band1/band2 一点都不碰 —— 脚步主体与方位线索就在这里
-                    if (b == 0 || b == 3) gdb += duckDb;
                     if (b >= 1) {
                         float guard = clampf((-6.0f - edb) / 12.0f + 1.f, 0.f, 1.f);
                         gdb += boostDb[b] * trSm_ * guard;
@@ -659,11 +571,6 @@ private:
     float fs_ = 48000.f;
     float trSm_ = 0.f;
     float tilt_ = 0.f;
-    float duck_ = 0.f;         // 枪声事件 duck 的当前生效比例（0..1）
-    float duckEnv_ = 0.f;      // 事件包络（快攻慢放）
-    float overMs_ = 0.f;        // 连续过载时长（duck 的门控）
-    float f3_ = 0.f, tAll_ = 0.f;   // 调试观测：高频占比 / 全带瞬态
-    float duckA_ = 0.f, duckR_ = 0.f;   // 每控制块的攻/放系数
     float gPrev_[4] = {1, 1, 1, 1}, gCur_[4] = {1, 1, 1, 1};
     float limCur_[4] = {1, 1, 1, 1}, limPrev_[4] = {1, 1, 1, 1};   // 分频段限幅增益
     float pendL_[4][kCB]{}, pendR_[4][kCB]{};                     // 1 个控制块的前视缓存
@@ -678,8 +585,6 @@ private:
     Env envFast_, envSlow_;
     Env envFastL_, envSlowL_;   // <150Hz 的快/慢包络
     Env envFastM_, envSlowM_;   // 150-3kHz 的快/慢包络
-    Biquad hp5k_;               // 5k 高通：枪声事件判据的专用探测支路
-    Env envH_;                  // >5k 包络
     Limiter limiter_;
     std::atomic<uint64_t> packed_{0};   // 参数打包传输（见 DspParams::Pack/Unpack）
     mutable DspParams cached_{};        // 仅供 Params() 返回引用用

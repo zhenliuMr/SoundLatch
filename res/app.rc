@@ -2,9 +2,9 @@
 
 // 版本号与 README / GitHub Release 保持同步
 #define SL_VER_MAJOR 1
-#define SL_VER_MINOR 3
+#define SL_VER_MINOR 2
 #define SL_VER_PATCH 0
-#define SL_VER_STR   "1.3.0"
+#define SL_VER_STR   "1.2.0"
 #define SL_BUILD_STR "2026-10-20"
 
 1 RT_MANIFEST "app.manifest"

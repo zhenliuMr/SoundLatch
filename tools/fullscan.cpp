@@ -144,13 +144,8 @@ static Metrics scanOne(const std::string& path, const std::string& vgm) {
     for (size_t i = 0; i + chunk <= mono.size(); i += chunk) {
         d.Process(io.data() + i * 2, (int)chunk);
         ++blocks;
-        double dk = d.LastDuck();
-        if (dk > m.duckMax) m.duckMax = dk;
-        if (dk > 0.05) ++duckBlocks;
-        m.f3Max   = std::max(m.f3Max,   (double)d.LastF3());
         m.tiltMax = std::max(m.tiltMax, (double)d.LastTilt());
         m.trSmMax = std::max(m.trSmMax, (double)d.LastTrSm());
-        m.overMax = std::max(m.overMax, (double)d.LastOverMs());
         for (size_t k = 0; k < chunk; ++k) {
             float a = io[2*(i+k)], b = io[2*(i+k)+1];
             if (!std::isfinite(a) || !std::isfinite(b)) { m.nan = true; continue; }
